@@ -591,6 +591,8 @@ class BigQmtRpcClient:
             "db": int(merged_redis_config.get("db") or _env_int("BIGQMT_REDIS_DB", 5)),
             "username": merged_redis_config.get("username", os.environ.get("BIGQMT_REDIS_USERNAME") or ""),
             "password": merged_redis_config.get("password", os.environ.get("BIGQMT_REDIS_PASSWORD") or ""),
+            # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 透传 protocol
+            "protocol": merged_redis_config.get("protocol") or _env_int("BIGQMT_REDIS_PROTOCOL", 2),
         }
         config_timeout = client_config.get("timeout_seconds")
         self.timeout_seconds = float(
@@ -800,6 +802,70 @@ class BigQmtRpcClient:
         if server_error:
             raise RuntimeError("Big QMT %s server_error: %s" % (method, server_error))
         return _restore_jsonable(response.get("data"))
+
+    # ------------------------------------------------------------------
+    # Async RPC (issue #63): call_async returns a Future immediately, so a
+    # caller can have many independent requests in flight instead of one
+    # blocking call at a time. The server still processes order RPCs on the
+    # QMT main thread serially — client-side async overlaps the round-trip
+    # latency, it does not parallelize the exchange leg.
+    _ASYNC_RPC_MAX_IN_FLIGHT = 64
+
+    def _async_rpc_pool(self):
+        pool = getattr(self, "_rpc_async_pool", None)
+        if pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="bigqmt-rpc-async")
+            self._rpc_async_pool = pool
+            self._rpc_async_slots = threading.Semaphore(self._ASYNC_RPC_MAX_IN_FLIGHT)
+            self._rpc_async_dispatcher = None
+        return pool
+
+    def call_async(self, method, params=None, account_id=None, timeout_seconds=None, callback=None):
+        """Submit an RPC without blocking; returns concurrent.futures.Future.
+
+        ``callback`` (optional) receives the result on a single dispatcher
+        thread — callbacks fire serialized in completion order, never
+        concurrently. In-flight requests are bounded; when the limit is hit
+        the call raises instead of queueing unboundedly.
+        """
+        pool = self._async_rpc_pool()
+        if not self._rpc_async_slots.acquire(timeout=30.0):
+            raise RuntimeError(
+                "too many RPCs in flight (max %d)" % self._ASYNC_RPC_MAX_IN_FLIGHT
+            )
+
+        def _run():
+            try:
+                return self.call(method, params, account_id=account_id,
+                                 timeout_seconds=timeout_seconds)
+            finally:
+                self._rpc_async_slots.release()
+
+        future = pool.submit(_run)
+        if callback is not None:
+            if self._rpc_async_dispatcher is None:
+                from concurrent.futures import ThreadPoolExecutor
+
+                self._rpc_async_dispatcher = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="bigqmt-rpc-dispatch"
+                )
+            dispatcher = self._rpc_async_dispatcher
+
+            def _deliver(fut):
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    log.warning("call_async %s failed: %s", method, exc)
+                    return
+                try:
+                    callback(result)
+                except Exception:
+                    log.exception("call_async callback failed: %s", method)
+
+            future.add_done_callback(lambda fut: dispatcher.submit(_deliver, fut))
+        return future
 
     def publish_event(self, event_type, payload, stream_template="bigqmt:quote_events:{account_id}"):
         account_id = str(self.account_id or "")
@@ -1303,7 +1369,7 @@ class BigQmtXtData:
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
         return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0):
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
         Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
@@ -1371,16 +1437,33 @@ class BigQmtXtData:
         finished = 0
         for i in range(0, total, step):
             batch = codes[i:i + step]
-            # get_market_data_ex is cache-through: it writes each code to the cache.
-            self.get_market_data_ex(
-                field_list=DEFAULT_DOWNLOAD_FIELDS,
-                stock_list=batch,
-                period=period,
-                start_time=start_time,
-                end_time=end_time,
-                count=-1,
-                dividend_type=dividend_type,
-            )
+            # QMT 的下载全局是「提交任务即返回」，数据在服务端异步落地
+            # （秒~分钟级）。下载后立刻读只能看到旧数据——issue #66 里
+            #「tick 只能获得最近 1 天」的真正原因就是这个竞态：数据还没落地
+            # 就已经被读走并缓存了空结果。这里分批轮询，直到批内每个代码都
+            # 出现真实数据行或超时（超时容忍停牌/退市等确实无数据的代码）。
+            deadline = time.time() + float(data_wait_seconds)
+            while True:
+                # get_market_data_ex 是 cache-through：每次轮询都会写入缓存，
+                # 最后一次（数据齐或超时）的结果即最终缓存内容。
+                data = self.get_market_data_ex(
+                    field_list=DEFAULT_DOWNLOAD_FIELDS,
+                    stock_list=batch,
+                    period=period,
+                    start_time=start_time,
+                    end_time=end_time,
+                    count=-1,
+                    dividend_type=dividend_type,
+                    fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
+                )
+                ready = 0
+                for code in batch:
+                    df = (data or {}).get(code)
+                    if df is not None and getattr(df, "shape", (0,))[0] > 0:
+                        ready += 1
+                if ready >= len(batch) or time.time() >= deadline:
+                    break
+                time.sleep(1.5)
             for code in batch:
                 finished += 1
                 if callback is not None:
@@ -1918,7 +2001,7 @@ class BigQmtXtTrader:
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
         try:
             self._sweep_order_barriers()
-            if event.get("event_type") in ("order", "trade") and self._hold_if_pending(event):
+            if event.get("event_type") in ("order", "trade", "order_error", "cancel_error") and self._hold_if_pending(event):
                 return
         except Exception:
             pass  # 屏障故障绝不能吞掉事件
@@ -1936,24 +2019,37 @@ class BigQmtXtTrader:
             elif event_type == "order":
                 callback.on_stock_order(self._order_from_dict(account_id, event))
             elif event_type == "order_error":
+                _sysid = str(event.get("order_sys_id") or "")
                 callback.on_order_error(
                     CompatObject(
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
-                        order_sys_id=event.get("order_sys_id") or "",
-                        order_id=event.get("order_sys_id") or "",
+                        order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
+                        order_sys_id=_sysid,      # 兼容别名
+                        order_id=_sysid,
                         stock_code=event.get("stock_code") or "",
-                        order_remark=str(event.get("remark") or event.get("user_order_id") or ""),
+                        order_remark=str(
+                            event.get("order_remark") or event.get("remark")
+                            or event.get("user_order_id") or ""
+                        ),
+                        strategy_name=str(event.get("strategy_name") or ""),
+                        status=_safe_int(event.get("status", event.get("order_status")), 0),
                     )
                 )
             elif event_type == "cancel_error":
+                _sysid = str(event.get("order_sys_id") or "")
                 callback.on_cancel_error(
                     CompatObject(
                         error_id=event.get("error_id"),
                         error_msg=event.get("error_msg") or "",
-                        order_sys_id=event.get("order_sys_id") or "",
-                        order_id=event.get("order_sys_id") or "",
+                        order_sysid=_sysid,       # MiniQMT 规范名 (issue #65)
+                        order_sys_id=_sysid,
+                        order_id=_sysid,
                         stock_code=event.get("stock_code") or "",
+                        order_remark=str(
+                            event.get("order_remark") or event.get("remark")
+                            or event.get("user_order_id") or ""
+                        ),
                     )
                 )
         except Exception:
@@ -2005,6 +2101,13 @@ class BigQmtXtTrader:
             frozen_cash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
             total_asset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
+            # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
+            m_strAccountID=account_id,
+            m_dCash=_safe_float(cash, 0.0) if cash is not None else None,
+            m_dAvailableCash=_safe_float(cash, 0.0) if cash is not None else None,
+            m_dFrozenCash=_safe_float(frozen_cash, 0.0) if frozen_cash is not None else 0.0,
+            m_dTotalAsset=_safe_float(total_asset, 0.0) if total_asset is not None else None,
+            m_dMarketValue=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
 
     def _position_object(self, account_id, item):
@@ -2012,14 +2115,16 @@ class BigQmtXtTrader:
         available = _safe_int(item.get("available", item.get("can_use_volume")))
         cost = _safe_float(item.get("cost", item.get("avg_price")))
         price = _safe_float(item.get("price", item.get("last_price")), cost)
+        stock_code = str(item.get("stock_code") or "")
+        stock_name = str(item.get("stock_name") or "")
         market_value = item.get("market_value")
         if market_value is None:
             market_value = price * volume
         return CompatObject(
             account_type=2,
             account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
-            stock_name=str(item.get("stock_name") or ""),
+            stock_code=stock_code,
+            stock_name=stock_name,
             volume=volume,
             can_use_volume=available,
             enable_amount=available,
@@ -2033,6 +2138,22 @@ class BigQmtXtTrader:
             on_road_volume=_safe_int(item.get("on_road_volume")),
             yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
             direction=_safe_int(item.get("direction"), 48),
+            # ===== 原生 xtquant 字段名别名（兼容 m_ 前缀访问）=====
+            m_strAccountID=account_id,
+            m_strStockCode=stock_code,
+            m_strStockName=stock_name,
+            m_nVolume=volume,
+            m_nCanUseVolume=available,
+            m_nCanUseVol=available,
+            m_nEnableAmount=available,
+            m_dOpenPrice=_safe_float(item.get("open_price"), cost),
+            m_dAvgPrice=cost,
+            m_dLastPrice=price,
+            m_dMarketValue=_safe_float(market_value, 0.0),
+            m_nFrozenVolume=_safe_int(item.get("frozen_volume")),
+            m_nOnRoadVolume=_safe_int(item.get("on_road_volume")),
+            m_nYesterdayVolume=_safe_int(item.get("yesterday_volume"), volume),
+            m_nDirection=_safe_int(item.get("direction"), 48),
         )
 
     @staticmethod
@@ -2339,6 +2460,7 @@ class BigQmtXtTrader:
                         CompatObject(
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
+                            order_sysid="",          # MiniQMT 规范名 (issue #65)
                             order_sys_id="",
                             order_id="",
                             stock_code=stock_code,
@@ -2369,6 +2491,7 @@ class BigQmtXtTrader:
                         CompatObject(
                             error_id=-1,
                             error_msg="order submit failed (order_stock returned -1)",
+                            order_sysid="",          # MiniQMT 规范名 (issue #65)
                             order_sys_id="",
                             order_id="",
                             stock_code=stock_code,
@@ -2392,6 +2515,7 @@ class BigQmtXtTrader:
                         account_id=self.client.account_id,
                         seq=seq,
                         order_id=order_sys_id or user_order_id,
+                        order_sysid=order_sys_id,    # MiniQMT 规范名 (issue #65)
                         order_sys_id=order_sys_id,
                         stock_code=stock_code,
                         strategy_name=str(kwargs.get("strategy_name") or (args[6] if len(args) > 6 else "")),
@@ -2655,6 +2779,7 @@ class BigQmtXtTrader:
                         CompatObject(
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
+                            order_sysid=str(order_id or ""),
                             order_sys_id=str(order_id or ""),
                             order_id=str(order_id or ""),
                             stock_code="",
@@ -2675,6 +2800,7 @@ class BigQmtXtTrader:
                         # 失败时给出非零错误码和可读 error_msg。
                         cancel_result=0 if ok else -1,
                         error_msg="" if ok else "cancel_order_stock rejected by server",
+                        order_sysid=str(order_id or ""),
                         order_sys_id=str(order_id or ""),
                         order_id=str(order_id or ""),
                     ),
@@ -2697,6 +2823,7 @@ class BigQmtXtTrader:
                         CompatObject(
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
+                            order_sysid=str(order_sysid or ""),
                             order_sys_id=str(order_sysid or ""),
                             order_id=str(order_sysid or ""),
                             stock_code="",
@@ -2717,6 +2844,7 @@ class BigQmtXtTrader:
                         # 失败时给出非零错误码和可读 error_msg。
                         cancel_result=0 if ok else -1,
                         error_msg="" if ok else "cancel_order_stock rejected by server",
+                        order_sysid=str(order_sysid or ""),
                         order_sys_id=str(order_sysid or ""),
                         order_id=str(order_sysid or ""),
                     ),

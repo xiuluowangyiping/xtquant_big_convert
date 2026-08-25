@@ -264,6 +264,39 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].direction, 48)
         self.assertEqual(single.stock_code, "600000.SH")
 
+    def test_asset_and_position_objects_carry_native_m_prefixed_aliases(self):
+        # PR #67: 原生 xtquant 客户端（如 miniqmt_redis）读 m_ 前缀字段。
+        # 回归锚点：别名引用的局部变量必须先定义（曾 NameError 漏网）。
+        trader = self._trader()
+        acc = StockAccount("acct")
+
+        asset = trader.query_stock_asset(acc)
+        positions = trader.query_stock_positions(acc)
+        single = trader.query_stock_position(acc, "600000")
+
+        self.assertEqual(asset.m_strAccountID, "acct")
+        self.assertEqual(asset.m_dCash, 100.5)
+        self.assertEqual(asset.m_dAvailableCash, 100.5)
+        self.assertEqual(asset.m_dTotalAsset, 1000.5)
+        self.assertEqual(asset.m_dMarketValue, 900.0)
+
+        pos = positions[0]
+        self.assertEqual(pos.m_strAccountID, "acct")
+        self.assertEqual(pos.m_strStockCode, "600000.SH")
+        self.assertEqual(pos.m_strStockName, "PF Bank")
+        self.assertEqual(pos.m_nVolume, 1000)
+        self.assertEqual(pos.m_nCanUseVolume, 800)
+        self.assertEqual(pos.m_nCanUseVol, 800)
+        self.assertEqual(pos.m_nEnableAmount, 800)
+        self.assertEqual(pos.m_dAvgPrice, 10.2)
+        self.assertEqual(pos.m_dLastPrice, 10.8)
+        self.assertEqual(pos.m_dMarketValue, 10800.0)
+        self.assertEqual(pos.m_nFrozenVolume, 200)
+        self.assertEqual(pos.m_nOnRoadVolume, 5)
+        self.assertEqual(pos.m_nYesterdayVolume, 900)
+        self.assertEqual(pos.m_nDirection, 48)
+        self.assertEqual(single.m_strStockCode, "600000.SH")
+
     def test_orders_trades_order_and_cancel_are_miniqmt_shaped(self):
         trader = self._trader()
         acc = StockAccount("acct")
@@ -623,6 +656,67 @@ class XtquantCompatTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as ctx:
             client.call("order_stock", {"stock_code": "600000.SH"})
         self.assertIn("not found in system", str(ctx.exception))
+
+    def test_call_async_returns_future_and_resolves(self):
+        # issue #63: call_async 不阻塞，返回 Future，结果正确
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                return {"ok": True, "data": {"pong": True, "method": request["method"]}}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+
+        futures = [client.call_async("ping", {"i": i}) for i in range(5)]
+        results = [f.result(timeout=5) for f in futures]
+        self.assertTrue(all(r["pong"] for r in results))
+        self.assertEqual([r["method"] for r in results], ["ping"] * 5)
+
+    def test_call_async_callback_serialized_on_dispatcher(self):
+        # 回调在单 dispatcher 线程上串行派发（不并发）
+        import threading as _th
+
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                return {"ok": True, "data": {"i": request["params"]["i"]}}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+
+        got = []
+        got_lock = _th.Lock()
+        done = _th.Event()
+        counter = {"n": 0}
+
+        def cb(result):
+            with got_lock:
+                got.append(result["i"])
+                counter["n"] += 1
+                if counter["n"] == 10:
+                    done.set()
+
+        for i in range(10):
+            client.call_async("ping", {"i": i}, callback=cb)
+        self.assertTrue(done.wait(5))
+        self.assertEqual(sorted(got), list(range(10)))
+
+    def test_call_async_failure_does_not_invoke_callback(self):
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                return {"ok": False, "error": "boom"}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+
+        called = []
+        fut = client.call_async("ping", callback=lambda r: called.append(r))
+        with self.assertRaises(RuntimeError):
+            fut.result(timeout=5)
+        import time as _t
+        _t.sleep(0.3)  # 给 dispatcher 一个机会（它不应触发）
+        self.assertEqual(called, [])
 
     def test_zmq_with_explicit_address_never_builds_redis_discovery(self):
         client = BigQmtRpcClient(

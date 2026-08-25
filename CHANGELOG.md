@@ -2,6 +2,47 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.2.8] - 2026-08-25
+
+### 修复
+
+- **期货持仓代码解析错误**（PR #68，@ReCodeLife）：裸期货合约（交易所字段为迅投简称 DF/SF/ZF）被错误送进股票归一化并抛 invalid stock code。改为**按交易所字段分类，不再猜代码形状**：迅投简称（IF/SF/DF/ZF/INE/GF）拼接后缀并**保留符号原始大小写**（`rb2401.SF` 小写 / `AP401.ZF` 大写，两者不可互换）；股票/港股通走归一化；`code_utils` 补 `.HGT` / `.SGT` 后缀识别。
+- **一行无法解析的数据会搞垮整个查询**（PR #70）：上一条让 `_full_code` 遇到柜台式交易所 ID 时抛异常——信号本身是对的，但三个调用方的行循环都没有逐行保护，异常会一路抛出 `get_positions` / `query_orders` / `query_trades`。**一行异常 = 整个持仓查不到**；而 `query_orders` 外层 `except` 返回 `[]`，丢的是全部委托。对交易系统而言这比它要报告的问题更危险，也与本模块「降级而非崩溃」的既定风格矛盾（POSITION 查询外的 try/except 注释即为 *degrade to empty*）。现在跳过解析不了的那一行、其余照常返回，跳过按 `(kind, exchange)` 只记一次日志。
+
+### 新增
+
+- **`BIGQMT_ACCOUNT_TYPE` 配置**（PR #68）：账号类型独立可配（默认 `STOCK`，另有 `CREDIT` / `FUTURE` / `OPTION`），`redis_rpc_runtime` 向后兼容读取并归一化为大写字符串后传入 `configure()`。旧配置不写此项时行为不变。
+
+### 已知限制
+
+- **#58 的期货小写代码仍缺实盘样本**：`get_full_tick(['rb2708.SF'])` 返回空，无法据此判断大小写还原是否生效（空结果说明该合约无数据，而非映射失败）。本版持仓侧的大小写保留由单测覆盖。
+- **单文件构建（#56）未进主干**：报告人提交的 `build_no_redis_single_file_flat.py` 依赖两个未附带的模块和 `bigqmt_no_redis/` 目录，尚不能独立运行；其惰性加载架构优于此前方案（PR #62 已关闭），待依赖补齐后合入。
+
+---
+
+## [Unreleased]
+
+### 新增
+
+- **Redis 5.x 兼容**（PR #67，@sunjian710）：`build_redis_client` 透传 `protocol`（默认 2/RESP2，可用 `protocol: 3` 或 `BIGQMT_REDIS_PROTOCOL` 覆盖）——redis-py 8.x 默认 RESP3 的 HELLO 握手在 Redis 5.0 上直接报错，现在开箱即用。客户端 `BigQmtRpcClient` 的 redis_config 同样透传。
+- **持仓/资产对象原生字段别名**（PR #67，@sunjian710）：`query_stock_positions`/`query_stock_asset` 返回对象新增 `m_` 前缀原生字段（`m_strStockCode`/`m_nVolume`/`m_dCash`/`m_dTotalAsset` 等），读原生 xtquant 字段名的客户端代码（如 miniqmt_redis 风格）不再 AttributeError。
+
+### 修复
+
+- PR #67 合入修正：`_position_object` 的 m_ 别名引用了未定义局部变量（`stock_code`/`stock_name` 只内联在 kwargs 里），持仓查询全挂——提取为局部变量并补回归测试钉住全部别名。
+
+## [0.2.6] - 2026-08-24
+
+### 修复
+
+- **回调对象字段命名不一致**（Issue #65）：`on_order_error`/`on_cancel_error`/async 回报的委托号字段是 `order_sys_id`，而 `on_stock_order`/`on_stock_trade` 用 MiniQMT 规范名 `order_sysid`。全部回调对象现在同时携带两个名字（同值），另补 `order_remark`/`status`/`strategy_name`。
+- **on_order_error 缺 order_remark/status**（Issue #64）：服务端事件补上 `m_strRemark`→`order_remark`/`user_order_id` 与 `m_nOrderStatus`→`status`，撤单错误事件同步补齐。柜台的拒单理由此前已在 `error_msg`（m_strCancelInfo，#60）。
+- **tick 分笔下载后立读为空**（Issue #66）：两个叠加问题——①QMT 下载全局提交即返回、数据异步落地，下载后立即读读到的是落地前的空结果；②FormulaServer 快速路径不服务 tick/L2 周期却静默返回空，把 RPC 桥的正确答案挡在门外。修复：download_history_data2 分批轮询直到批内每个代码出现真实数据行（`data_wait_seconds` 超时容忍停牌/退市）；FormulaServer 对 tick/l2 周期拒绝路由、回落 RPC。实盘验证：tick 下载 0820 → 立读 1434 行全部属当日。
+- **拒单回报乱序**（Issue #51 屏障补全）：服务端在应答 RPC 之前就推送废单事件，order_error/cancel_error 此前不在屏障内，会比 async_response 先到（实盘实测倒挂）。屏障现在同时扣住 order/trade/order_error/cancel_error，实盘验证顺序：async_response → 已报(50) → 废单(57) → order_error。
+- **call_async 异步 RPC**（Issue #63）：`client.call_async(method, params, callback=None)` 立即返回 Future，不阻塞调用方；有界在途（64）+ 8 线程池；可选 callback 在单 dispatcher 线程按完成顺序串行派发。注意：下单类 RPC 在服务端仍由 QMT 主线程串行处理，客户端异步叠加的是往返延迟，不会并行化报单到交易所的环节。
+
+---
+
 ## [0.2.5] - 2026-08-21
 
 ### 修复

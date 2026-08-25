@@ -11,6 +11,7 @@ from bigqmt_signal_trader.adapter_factory import build_app
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
 from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
+from bigqmt_signal_trader.adapters.position_bigqmt import _full_code
 from bigqmt_signal_trader.models import OrderRef, OrderRequest
 
 
@@ -75,6 +76,36 @@ class FakeMarketDataFallbackContext(FakeContext):
 
 
 class BigQmtAdaptersTest(unittest.TestCase):
+
+    def test_position_code_keeps_future_contract_code(self):
+        # A futures row always carries the XunTou-short exchange token, so a
+        # bare contract with an empty exchange is not futures -- normalize it
+        # and let an unrecognizable code raise as malformed.
+        with self.assertRaises(ValueError):
+            _full_code("EG2609", "")
+        with self.assertRaises(ValueError):
+            _full_code("IF2609", "")
+        self.assertEqual(_full_code("600000", "SH"), "600000.SH")
+
+    def test_futures_exchange_short_token_appends_suffix_and_preserves_case(self):
+        """Futures are classified by the exchange field (XunTou-short token),
+        which is appended as the suffix. The symbol keeps the exchange's exact
+        case (e.g. rb2401.SF lower, AP401.ZF upper) and must not be rewritten."""
+        self.assertEqual(_full_code("rb2401", "SF"), "rb2401.SF")   # SHFE lower-case
+        self.assertEqual(_full_code("AP401", "ZF"), "AP401.ZF")     # CZCE upper-case
+        self.assertEqual(_full_code("a2609", "DF"), "a2609.DF")     # DCE lower-case
+        self.assertEqual(_full_code("sc2401", "INE"), "sc2401.INE") # INE lower-case
+        self.assertEqual(_full_code("IF2609", "IF"), "IF2609.IF")   # CFFEX
+        self.assertEqual(_full_code("GF2609", "GF"), "GF2609.GF")   # GFEX
+
+    def test_futures_display_exchange_id_raises(self):
+        """A counter display ID (DCE/CFFEX/...) is an unexpected path: POSITION
+        rows normally carry the XunTou-short token (DF/SF/...), so this signals
+        a structure/vendor mismatch and must surface rather than degrade."""
+        for exchange in ("DCE", "CFFEX"):
+            with self.assertRaises(ValueError):
+                _full_code("EG2609", exchange)
+
     def test_market_provider_normalizes_codes_before_context_call(self):
         context = FakeContext()
         provider = BigQmtMarketDataProvider(context)
@@ -394,3 +425,91 @@ class FinancialFieldTranslateTest(unittest.TestCase):
         self.assertEqual(calls[0][0], ["CustomTable"])
 
 
+
+
+class UnparsableRowIsolationTest(unittest.TestCase):
+    """A row _full_code cannot parse must cost that row, not the query.
+
+    PR #68 made _full_code raise on a counter-style futures exchange ID, which
+    is the right signal -- but every caller loops without per-row protection, so
+    one odd row turned "one position missing" into "no positions at all". For a
+    trading system that is the more dangerous failure.
+    """
+
+    class _Row(object):
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    def _rows(self):
+        return [
+            self._Row(m_strInstrumentID="600000", m_strExchangeID="SH",
+                      m_nVolume=100, m_nCanUseVolume=100,
+                      m_nVolumeTotalOriginal=100, m_nVolumeTraded=0,
+                      m_strTradeID="t1", m_nVolume_deal=1),
+            # Counter-style display ID -- _full_code raises on this one.
+            self._Row(m_strInstrumentID="rb2401", m_strExchangeID="SHFE",
+                      m_nVolume=1, m_nCanUseVolume=1,
+                      m_nVolumeTotalOriginal=1, m_nVolumeTraded=0,
+                      m_strTradeID="t2"),
+            self._Row(m_strInstrumentID="000001", m_strExchangeID="SZ",
+                      m_nVolume=200, m_nCanUseVolume=200,
+                      m_nVolumeTotalOriginal=200, m_nVolumeTraded=0,
+                      m_strTradeID="t3"),
+        ]
+
+    def setUp(self):
+        from bigqmt_signal_trader.adapters import position_bigqmt
+
+        position_bigqmt._unparsable_rows_reported.clear()
+
+    def test_positions_survive_one_unparsable_row(self):
+        from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
+
+        rows = self._rows()
+        provider = BigQmtPositionProvider(lambda a, t, d: rows if d == "POSITION" else [])
+
+        positions = provider.get_positions("acct")
+
+        self.assertEqual(sorted(positions), ["000001.SZ", "600000.SH"])
+
+    def test_orders_survive_one_unparsable_row(self):
+        from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
+
+        rows = self._rows()
+        gateway = BigQmtOrderGateway(
+            context_info=None, passorder_func=None, cancel_func=None,
+            get_trade_detail_data_func=lambda a, t, d, s="": rows if d == "ORDER" else [])
+
+        orders = gateway.query_orders("acct", "")
+
+        self.assertEqual(sorted(o.stock_code for o in orders), ["000001.SZ", "600000.SH"])
+
+    def test_trades_survive_one_unparsable_row(self):
+        from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
+
+        rows = self._rows()
+        gateway = BigQmtOrderGateway(
+            context_info=None, passorder_func=None, cancel_func=None,
+            get_trade_detail_data_func=lambda a, t, d, s="": rows if d == "DEAL" else [])
+
+        trades = gateway.query_trades("acct", "")
+
+        self.assertEqual(sorted(t.stock_code for t in trades), ["000001.SZ", "600000.SH"])
+
+    def test_the_skipped_row_is_reported_once(self):
+        import contextlib
+        import io as _io
+
+        from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
+
+        rows = self._rows()
+        provider = BigQmtPositionProvider(lambda a, t, d: rows if d == "POSITION" else [])
+        buffer = _io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            provider.get_positions("acct")
+            provider.get_positions("acct")
+        output = buffer.getvalue()
+
+        self.assertEqual(output.count("skipping unparsable"), 1)
+        self.assertIn("rb2401", output)
+        self.assertIn("SHFE", output)
