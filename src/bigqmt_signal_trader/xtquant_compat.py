@@ -14,12 +14,13 @@ import threading
 import importlib
 import datetime as _dt
 from typing import Any, Dict, Iterable, List, Optional
+from xtquant.xtconstant import *
+from xtquant.xttype import StockAccount
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
-
 
 log = get_logger("xtquant_compat")
 
@@ -40,15 +41,6 @@ def _as_list(value):
     return list(value)
 
 
-STOCK_BUY = 23
-STOCK_SELL = 24
-FIX_PRICE = 11
-LATEST_PRICE = 5
-MARKET_PEER_PRICE_FIRST = 44
-MARKET_SH_CONVERT_5_LIMIT = 43
-MARKET_SZ_CONVERT_5_CANCEL = 47
-SZ_MARKET = 1
-SH_MARKET = 0
 
 CLIENT_CONFIG_MODULE_ENV = "BIGQMT_CLIENT_CONFIG_MODULE"
 DEFAULT_CLIENT_CONFIG_MODULES = (
@@ -56,134 +48,6 @@ DEFAULT_CLIENT_CONFIG_MODULES = (
     "bigqmt_signal_trader_local_config",
 )
 
-ORDER_UNREPORTED = 48
-ORDER_WAIT_REPORTING = 49
-ORDER_REPORTED = 50
-ORDER_REPORTED_CANCEL = 51
-ORDER_PARTSUCC_CANCEL = 52
-ORDER_PART_CANCEL = 53
-ORDER_CANCELED = 54
-ORDER_PART_SUCC = 55
-ORDER_SUCCEEDED = 56
-ORDER_JUNK = 57
-ORDER_UNKNOWN = 255
-
-# ---------------------------------------------------------------------------
-# xtconstant 枚举常量（对齐原生 MiniQMT xtquant/xtconstant.py，91 个全量）
-# ---------------------------------------------------------------------------
-
-# 账号类型
-FUTURE_ACCOUNT = 1            # 期货
-SECURITY_ACCOUNT = 2          # 股票
-CREDIT_ACCOUNT = 3            # 信用
-FUTURE_OPTION_ACCOUNT = 5     # 期货期权
-STOCK_OPTION_ACCOUNT = 6      # 股票期权
-HUGANGTONG_ACCOUNT = 7        # 沪港通
-SHENGANGTONG_ACCOUNT = 11     # 深港通
-
-# 委托类型 - 期货六键风格
-FUTURE_OPEN_LONG = 0                  # 开多
-FUTURE_CLOSE_LONG_HISTORY = 1         # 平昨多
-FUTURE_CLOSE_LONG_TODAY = 2           # 平今多
-FUTURE_OPEN_SHORT = 3                 # 开空
-FUTURE_CLOSE_SHORT_HISTORY = 4        # 平昨空
-FUTURE_CLOSE_SHORT_TODAY = 5          # 平今空
-# 委托类型 - 期货四键风格
-FUTURE_CLOSE_LONG_TODAY_FIRST = 6     # 平多，优先平今
-FUTURE_CLOSE_LONG_HISTORY_FIRST = 7   # 平多，优先平昨
-FUTURE_CLOSE_SHORT_TODAY_FIRST = 8    # 平空，优先平今
-FUTURE_CLOSE_SHORT_HISTORY_FIRST = 9  # 平空，优先平昨
-# 委托类型 - 期货两键风格
-FUTURE_CLOSE_LONG_TODAY_HISTORY_THEN_OPEN_SHORT = 10  # 卖出，优先平仓平今，余量开空
-FUTURE_CLOSE_LONG_HISTORY_TODAY_THEN_OPEN_SHORT = 11  # 卖出，优先平仓平昨，余量开空
-FUTURE_CLOSE_SHORT_TODAY_HISTORY_THEN_OPEN_LONG = 12  # 买入，优先平仓平今，余量开多
-FUTURE_CLOSE_SHORT_HISTORY_TODAY_THEN_OPEN_LONG = 13  # 买入，优先平仓平昨，余量开多
-FUTURE_OPEN = 14               # 买入，不优先平仓
-FUTURE_CLOSE = 15              # 卖出，不优先平仓
-# 委托类型 - 期货跨商品套利
-FUTURE_ARBITRAGE_OPEN = 16               # 开仓
-FUTURE_ARBITRAGE_CLOSE_HISTORY_FIRST = 17  # 平，优先平昨
-FUTURE_ARBITRAGE_CLOSE_TODAY_FIRST = 18    # 平，优先平今
-# 委托类型 - 期货展期
-FUTURE_RENEW_LONG_CLOSE_HISTORY_FIRST = 19   # 看多，优先平昨
-FUTURE_RENEW_LONG_CLOSE_TODAY_FIRST = 20     # 看多，优先平今
-FUTURE_RENEW_SHORT_CLOSE_HISTORY_FIRST = 21  # 看空，优先平昨
-FUTURE_RENEW_SHORT_CLOSE_TODAY_FIRST = 22    # 看空，优先平今
-
-# 委托类型 - 股票
-STOCK_BUY = 23
-STOCK_SELL = 24
-# 委托类型 - 信用交易
-CREDIT_BUY = 23                       # 担保品买入
-CREDIT_SELL = 24                      # 担保品卖出
-CREDIT_FIN_BUY = 27                   # 融资买入
-CREDIT_SLO_SELL = 28                  # 融券卖出
-CREDIT_BUY_SECU_REPAY = 29            # 买券还券
-CREDIT_DIRECT_SECU_REPAY = 30         # 直接还券
-CREDIT_SELL_SECU_REPAY = 31           # 卖券还款
-CREDIT_DIRECT_CASH_REPAY = 32         # 直接还款
-CREDIT_FIN_BUY_SPECIAL = 40           # 专项融资买入
-CREDIT_SLO_SELL_SPECIAL = 41          # 专项融券卖出
-CREDIT_BUY_SECU_REPAY_SPECIAL = 42    # 专项买券还券
-CREDIT_DIRECT_SECU_REPAY_SPECIAL = 43  # 专项直接还券
-CREDIT_SELL_SECU_REPAY_SPECIAL = 44   # 专项卖券还款
-CREDIT_DIRECT_CASH_REPAY_SPECIAL = 45  # 专项直接还款
-
-# 委托类型 - 股票期权
-STOCK_OPTION_BUY_OPEN = 48       # 买入开仓
-STOCK_OPTION_SELL_CLOSE = 49     # 卖出平仓
-STOCK_OPTION_SELL_OPEN = 50      # 卖出开仓
-STOCK_OPTION_BUY_CLOSE = 51      # 买入平仓
-STOCK_OPTION_COVERED_OPEN = 52   # 备兑开仓
-STOCK_OPTION_COVERED_CLOSE = 53  # 备兑平仓
-STOCK_OPTION_CALL_EXERCISE = 54  # 认购行权
-STOCK_OPTION_PUT_EXERCISE = 55   # 认沽行权
-STOCK_OPTION_SECU_LOCK = 56      # 证券锁定
-STOCK_OPTION_SECU_UNLOCK = 57    # 证券解锁
-
-# 委托类型 - 期货期权
-OPTION_FUTURE_OPTION_EXERCISE = 100  # 期货期权行权
-
-# 报价类型（市价）
-LATEST_PRICE = 5                        # 最新价
-FIX_PRICE = 11                          # 指定价/限价
-MARKET_SH_CONVERT_5_CANCEL = 42         # 最优五档即时成交剩余撤销[上交所][股票]
-MARKET_SH_CONVERT_5_LIMIT = 43          # 最优五档即时成交剩转限价[上交所][股票]
-MARKET_PEER_PRICE_FIRST = 44            # 对手方最优价格委托
-MARKET_MINE_PRICE_FIRST = 45            # 本方最优价格委托
-MARKET_SZ_INSTBUSI_RESTCANCEL = 46      # 即时成交剩余撤销委托[深交所][股票][期权]
-MARKET_SZ_CONVERT_5_CANCEL = 47         # 最优五档即时成交剩余撤销[深交所][股票][期权]
-MARKET_SZ_FULL_OR_CANCEL = 48           # 全额成交或撤销委托[深交所][股票][期权]
-
-# 市场代码
-SH_MARKET = 0
-SZ_MARKET = 1
-
-# 委托状态
-ORDER_UNREPORTED = 48
-ORDER_WAIT_REPORTING = 49
-ORDER_REPORTED = 50
-ORDER_REPORTED_CANCEL = 51
-ORDER_PARTSUCC_CANCEL = 52
-ORDER_PART_CANCEL = 53
-ORDER_CANCELED = 54
-ORDER_PART_SUCC = 55
-ORDER_SUCCEEDED = 56
-ORDER_JUNK = 57
-ORDER_UNKNOWN = 255
-
-# 账号状态
-ACCOUNT_STATUS_INVALID = -1       # 无效
-ACCOUNT_STATUS_OK = 0             # 正常
-ACCOUNT_STATUS_WAITING_LOGIN = 1  # 连接中
-ACCOUNT_STATUSING = 2             # 登陆中
-ACCOUNT_STATUS_FAIL = 3           # 失败
-ACCOUNT_STATUS_INITING = 4        # 初始化中
-ACCOUNT_STATUS_CORRECTING = 5     # 数据刷新校正中
-ACCOUNT_STATUS_CLOSED = 6         # 收盘后
-ACCOUNT_STATUS_ASSIS_FAIL = 7     # 穿透副链接断开
-ACCOUNT_STATUS_DISABLEBYSYS = 8   # 系统停用
-ACCOUNT_STATUS_DISABLEBYUSER = 9  # 用户停用
 
 
 class CompatObject:
@@ -197,10 +61,7 @@ class CompatObject:
         return "%s(%s)" % (self.__class__.__name__, items)
 
 
-class StockAccount:
-    def __init__(self, account_id, account_type="STOCK"):
-        self.account_id = str(account_id or "")
-        self.account_type = str(account_type or "STOCK")
+
 
 
 class XtQuantTraderCallback:
@@ -697,11 +558,16 @@ class BigQmtRpcClient:
         if self.redis_client is None:
             import redis
 
+            from .adapters.redis_common import redis_supports_protocol_kw
+
             cfg = dict(self.redis_config)
             if not cfg.get("username"):
                 cfg.pop("username", None)
             if not cfg.get("password"):
                 cfg.pop("password", None)
+            if not redis_supports_protocol_kw():
+                # QMT 自带 redis-py 3.5.3 不认 protocol（issue #71）
+                cfg.pop("protocol", None)
             self.redis_client = redis.Redis(**cfg)
         return self.redis_client
 
@@ -2358,6 +2224,10 @@ class BigQmtXtTrader:
     # 异步下单这一条路径上——手工下单、同步下单、以及任何未登记的委托一律直通。
     # ------------------------------------------------------------------
     ASYNC_BARRIER_TIMEOUT_SECONDS = 10.0
+    # response 触发前等屏障从暂存的委托事件里学到委托号的上限（issue #72）。
+    # 委托号异步分配：推送通常比 RPC 应答快，几百毫秒内就能学到；超时则按
+    # 原样发 response（order_id 回落 remark），不拖住回调。
+    ASYNC_SYSID_WAIT_SECONDS = 2.0
 
     def _order_barrier(self):
         barrier = getattr(self, "_async_barrier", None)
@@ -2450,8 +2320,9 @@ class BigQmtXtTrader:
         remark = self._async_remark(args, kwargs)
         callback = self.callback
         try:
-            # wait_settlement=False: return as soon as passorder ran. The order
-            # id arrives via order_callback, which is what MiniQMT does too.
+            # wait_settlement=False：passorder 一返回就应答，不在 worker 里等
+            # 服务端结算（那是 #69 要的吞吐）。委托号从推送事件学——屏障暂存的
+            # 委托事件里会带上（触发 response 前至多等 2s，学不到就回落 remark）。
             result = self.order_stock_result(*args, wait_settlement=False, **kwargs)
         except Exception as exc:
             if callback is not None:
@@ -2507,9 +2378,24 @@ class BigQmtXtTrader:
         if callback is not None:
             try:
                 # Native XtOrderResponse shape: one argument carrying
-                # account_id/order_id/seq/error_msg. order_id may be empty here
-                # -- the id is assigned asynchronously and lands in the
-                # order_callback push (issue #50).
+                # account_id/order_id/seq/error_msg.
+                #
+                # 委托号异步分配（#50）：服务端应答时通常还没有。触发 response 前
+                # 先等屏障从暂存的委托事件里学到委托号（事件推送一般比 RPC 应答
+                # 快，bounded 2s），否则 order_id 只能回落成 remark，调用方按
+                # order_id 管理委托时会拿不到真实委托号（issue #72）。
+                if not order_sys_id and remark:
+                    wait_deadline = time.time() + self.ASYNC_SYSID_WAIT_SECONDS
+                    while time.time() < wait_deadline:
+                        learned = ""
+                        with self._async_barrier_lock:
+                            entry = self._async_barrier.get(remark)
+                            if entry and entry["sys_ids"]:
+                                learned = sorted(entry["sys_ids"])[0]
+                        if learned:
+                            order_sys_id = learned
+                            break
+                        time.sleep(0.05)
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
