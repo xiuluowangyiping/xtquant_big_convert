@@ -14,7 +14,16 @@ import threading
 import importlib
 import datetime as _dt
 from typing import Any, Dict, Iterable, List, Optional
-from xtquant.xtconstant import *
+# Only these three are used below, but every public constant is re-exported
+# further down: docs/XTQUANT_COMPAT_REPLACEMENT.md tells callers to do
+# ``from bigqmt_signal_trader import xtquant_compat as xtconstant`` and read
+# e.g. ``xtconstant.ORDER_SUCCEEDED`` off this module.
+#
+# This is deliberately not ``from xtquant.xtconstant import *``. That form is a
+# SyntaxError ("import * only allowed at module level") in the single-file QMT
+# builds, which exec each module inside a function body (issue #76).
+from xtquant import xtconstant as _xtconstant
+from xtquant.xtconstant import ORDER_UNKNOWN, STOCK_BUY, STOCK_SELL
 from xtquant.xttype import StockAccount
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
@@ -23,6 +32,21 @@ from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
 
 log = get_logger("xtquant_compat")
+
+
+# Re-export every public xtconstant name on this module, replacing what
+# ``import *`` used to do implicitly. Before #73 these 110-odd constants were
+# defined here outright, and the documented "approach 1" migration path binds
+# this module as ``xtconstant``, so dropping them would break callers that read
+# e.g. ``xtquant_compat.FIX_PRICE``.
+#
+# Written as an explicit loop rather than ``import *`` (a SyntaxError inside the
+# single-file builds' function-scope exec, issue #76) and rather than a
+# module-level ``__getattr__`` (PEP 562, Python 3.7+, while QMT ships 3.6).
+for _const_name in dir(_xtconstant):
+    if not _const_name.startswith("_"):
+        globals().setdefault(_const_name, getattr(_xtconstant, _const_name))
+del _const_name
 
 
 # Default OHLCV fields pulled + cached by get_local_data fallback_rpc.
@@ -167,6 +191,45 @@ def _quote_push_zmq_address(client):
     port = zmq_config.get("port")
     base_port = int(port) if port is not None else _default_zmq_port(client.account_id)
     return "tcp://%s:%d" % (host, base_port + 1)
+
+
+def _missing_account_id_message():
+    """Say what was searched and what to do, not just that something is missing.
+
+    "Big QMT account_id is required" told the reader nothing about where the
+    config was looked for, so a config file placed one sys.path away from the
+    running interpreter looked identical to no config at all (issue #90).
+    """
+    searched = list(DEFAULT_CLIENT_CONFIG_MODULES)
+    selected = os.environ.get(CLIENT_CONFIG_MODULE_ENV)
+    if selected and selected not in searched:
+        searched.insert(0, selected)
+    found = None
+    try:
+        config = load_client_config()
+        found = (config or {}).get("module")
+    except Exception:
+        pass
+
+    if found:
+        detail = ("imported %s, but it defines no BIGQMT_ACCOUNT_ID"
+                  % found)
+    else:
+        detail = ("none of these modules could be imported: %s"
+                  % ", ".join(searched))
+    lines = [
+        "Big QMT account_id is required -- %s." % detail,
+        "Fix it in any one of these ways:",
+        "  1. put bigqmt_signal_trader_client_config.py somewhere on sys.path"
+        " (the current working directory counts), with BIGQMT_ACCOUNT_ID set;",
+        "  2. set the BIGQMT_ACCOUNT_ID environment variable;",
+        "  3. call bigqmt_signal_trader.xtquant_compat.configure(account_id=...)"
+        " before use;",
+        "  or run `bigqmt-init`, which writes both config files for you.",
+        "configure() also runs at import time, so a config put in place after"
+        " importing this module needs configure() called again.",
+    ]
+    return "\n".join(lines)
 
 
 def load_client_config(module_name=None):
@@ -624,7 +687,7 @@ class BigQmtRpcClient:
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
-            raise ValueError("Big QMT account_id is required")
+            raise ValueError(_missing_account_id_message())
         wait_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
         # Fast path: reference/history reads answered straight by QMT's
         # FormulaServer, bypassing the strategy process and its GIL. Anything it
@@ -1818,7 +1881,56 @@ class BigQmtXtTrader:
         except Exception:
             log.exception("user callback failed: on_account_status")
 
+    def _event_loop_push_channel(self):
+        """zmq: exec events arrive on the same PUB socket as whole-quote data.
+
+        Reuses _build_quote_push_channel so the address derivation stays in one
+        place. The subscriber runs its own thread, so this loop only keeps the
+        channel alive and rebuilds it if the account changes or it dies.
+        """
+        from .exec_events import EXEC_TOPICS
+
+        topics = sorted(set(EXEC_TOPICS.values()))
+        while self._event_running:
+            channel = None
+            account_id = str(self.client.account_id or "")
+            try:
+                channel = self._build_quote_push_channel()
+                channel.start_subscriber(topics, self._on_push_exec_event)
+                while self._event_running:
+                    if str(self.client.account_id or "") != account_id:
+                        break      # account changed -> rebuild against the new address
+                    time.sleep(0.5)
+            except Exception:
+                time.sleep(1.0)
+            finally:
+                if channel is not None:
+                    try:
+                        channel.stop()
+                    except Exception:
+                        pass
+
+    def _on_push_exec_event(self, topic, data):
+        """Push-channel callback. The payload is already a decoded dict, unlike
+        the Redis path which hands over raw bytes."""
+        try:
+            self._dispatch_event(data)
+        except Exception:
+            pass
+
     def _event_loop(self):
+        """Receive exec events. Redis deployments subscribe to the per-account
+        channels; zmq deployments ride the quote push channel.
+
+        Exec events used to be Redis-only, so a zmq deployment received no
+        order/trade callbacks at all -- silently, since the loop just failed to
+        connect and retried forever (issue #76).
+        """
+        transport = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
+        if transport == "zmq":
+            self._event_loop_push_channel()
+            return
+
         from .exec_events import (
             order_channel,
             trade_channel,
@@ -1854,14 +1966,22 @@ class BigQmtXtTrader:
                     pass
 
     def _dispatch_event(self, raw):
+        """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.
+
+        The push channel decodes msgpack/json itself, so it hands over a dict --
+        str(dict) is not valid JSON and would be silently dropped here.
+        """
         callback = self.callback
         if callback is None:
             return
-        try:
-            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
-            event = json.loads(text)
-        except Exception:
-            return
+        if isinstance(raw, dict):
+            event = raw
+        else:
+            try:
+                text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                event = json.loads(text)
+            except Exception:
+                return
         if not isinstance(event, dict):
             return
         # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
@@ -2039,6 +2159,119 @@ class BigQmtXtTrader:
             if not data:
                 raise
         return [self._position_object(account_id, item) for item in self._position_items(data)]
+
+    def query_position_statistics(self, account):
+        """Intraday position statistics (futures), mirroring MiniQMT ``query_position_statistics``.
+
+        Returns a list of :class:`XtPositionStatistics`-style :class:`CompatObject`.
+        The server queries via ``get_trade_detail_data(..., "POSITION_STATISTICS")``.
+        """
+        account_id = _account_id(account, self.client.account_id)
+        data = self.client.call(
+            "query_position_statistics",
+            {"account_id": account_id},
+            account_id=account_id,
+        ) or {}
+        return [self._position_statistics_object(account_id, item) for item in _as_list(data)]
+
+    def _position_statistics_object(self, account_id, item):
+        return CompatObject(
+            account_id=account_id,
+            exchange_id=str(item.get("exchange_id") or ""),
+            exchange_name=str(item.get("exchange_name") or ""),
+            product_id=str(item.get("product_id") or ""),
+            instrument_id=str(item.get("instrument_id") or ""),
+            instrument_name=str(item.get("instrument_name") or ""),
+            stock_code=str(item.get("stock_code") or ""),
+            direction=_safe_int(item.get("direction"), 0),
+            hedge_flag=_safe_int(item.get("hedge_flag"), 0),
+            position=_safe_int(item.get("position"), 0),
+            yesterday_position=_safe_int(item.get("yesterday_position"), 0),
+            today_position=_safe_int(item.get("today_position"), 0),
+            can_close_vol=_safe_int(item.get("can_close_vol"), 0),
+            position_cost=_safe_float(item.get("position_cost"), None),
+            avg_price=_safe_float(item.get("avg_price"), None),
+            position_profit=_safe_float(item.get("position_profit"), None),
+            float_profit=_safe_float(item.get("float_profit"), None),
+            open_price=_safe_float(item.get("open_price"), None),
+            used_margin=_safe_float(item.get("used_margin"), None),
+            used_commission=_safe_float(item.get("used_commission"), None),
+            frozen_margin=_safe_float(item.get("frozen_margin"), None),
+            frozen_commission=_safe_float(item.get("frozen_commission"), None),
+            instrument_value=_safe_float(item.get("instrument_value"), None),
+            open_times=_safe_int(item.get("open_times"), 0),
+            open_volume=_safe_int(item.get("open_volume"), 0),
+            cancel_times=_safe_int(item.get("cancel_times"), 0),
+            last_price=_safe_float(item.get("last_price"), None),
+            rise_ratio=_safe_float(item.get("rise_ratio"), None),
+            product_name=str(item.get("product_name") or ""),
+            royalty=_safe_float(item.get("royalty"), None),
+            expire_date=str(item.get("expire_date") or ""),
+            assest_weight=_safe_float(item.get("assest_weight"), None),
+            increase_by_settlement=_safe_float(item.get("increase_by_settlement"), None),
+            margin_ratio=_safe_float(item.get("margin_ratio"), None),
+            float_profit_divide_by_used_margin=_safe_float(
+                item.get("float_profit_divide_by_used_margin"), None
+            ),
+            float_profit_divide_by_balance=_safe_float(
+                item.get("float_profit_divide_by_balance"), None
+            ),
+            today_profit_loss=_safe_float(item.get("today_profit_loss"), None),
+            yesterday_init_position=_safe_int(item.get("yesterday_init_position"), 0),
+            frozen_royalty=_safe_float(item.get("frozen_royalty"), None),
+            today_close_profit_loss=_safe_float(item.get("today_close_profit_loss"), None),
+            close_profit=_safe_float(item.get("close_profit"), None),
+            ft_product_name=str(item.get("ft_product_name") or ""),
+            open_cost=_safe_float(item.get("open_cost"), None),
+            # ===== native xtquant field-name aliases (m_-prefixed access) =====
+            m_strAccountID=account_id,
+            m_strStockCode=str(item.get("stock_code") or ""),
+            m_strExchangeID=str(item.get("exchange_id") or ""),
+            m_strExchangeName=str(item.get("exchange_name") or ""),
+            m_strProductID=str(item.get("product_id") or ""),
+            m_strInstrumentID=str(item.get("instrument_id") or ""),
+            m_strInstrumentName=str(item.get("instrument_name") or ""),
+            m_nDirection=_safe_int(item.get("direction"), 0),
+            m_nHedgeFlag=_safe_int(item.get("hedge_flag"), 0),
+            m_nPosition=_safe_int(item.get("position"), 0),
+            m_nYestodayPosition=_safe_int(item.get("yesterday_position"), 0),
+            m_nTodayPosition=_safe_int(item.get("today_position"), 0),
+            m_nCanCloseVol=_safe_int(item.get("can_close_vol"), 0),
+            m_dPositionCost=_safe_float(item.get("position_cost"), None),
+            m_dAvgPrice=_safe_float(item.get("avg_price"), None),
+            m_dPositionProfit=_safe_float(item.get("position_profit"), None),
+            m_dFloatProfit=_safe_float(item.get("float_profit"), None),
+            m_dOpenPrice=_safe_float(item.get("open_price"), None),
+            m_dUsedMargin=_safe_float(item.get("used_margin"), None),
+            m_dUsedCommission=_safe_float(item.get("used_commission"), None),
+            m_dFrozenMargin=_safe_float(item.get("frozen_margin"), None),
+            m_dFrozenCommission=_safe_float(item.get("frozen_commission"), None),
+            m_dInstrumentValue=_safe_float(item.get("instrument_value"), None),
+            m_nOpenTimes=_safe_int(item.get("open_times"), 0),
+            m_nOpenVolume=_safe_int(item.get("open_volume"), 0),
+            m_nCancelTimes=_safe_int(item.get("cancel_times"), 0),
+            m_dLastPrice=_safe_float(item.get("last_price"), None),
+            m_dRiseRatio=_safe_float(item.get("rise_ratio"), None),
+            m_strProductName=str(item.get("product_name") or ""),
+            m_dRoyalty=_safe_float(item.get("royalty"), None),
+            m_strExpireDate=str(item.get("expire_date") or ""),
+            m_dAssestWeight=_safe_float(item.get("assest_weight"), None),
+            m_dIncreaseBySettlement=_safe_float(item.get("increase_by_settlement"), None),
+            m_dMarginRatio=_safe_float(item.get("margin_ratio"), None),
+            m_dFloatProfitDivideByUsedMargin=_safe_float(
+                item.get("float_profit_divide_by_used_margin"), None
+            ),
+            m_dFloatProfitDivideByBalance=_safe_float(
+                item.get("float_profit_divide_by_balance"), None
+            ),
+            m_dTodayProfitLoss=_safe_float(item.get("today_profit_loss"), None),
+            m_nYestodayInitPosition=_safe_int(item.get("yesterday_init_position"), 0),
+            m_dFrozenRoyalty=_safe_float(item.get("frozen_royalty"), None),
+            m_dTodayCloseProfitLoss=_safe_float(item.get("today_close_profit_loss"), None),
+            m_dCloseProfit=_safe_float(item.get("close_profit"), None),
+            m_strFtProductName=str(item.get("ft_product_name") or ""),
+            m_dOpenCost=_safe_float(item.get("open_cost"), None),
+        )
 
     def query_stock_position(self, account, stock_code):
         account_id = _account_id(account, self.client.account_id)
@@ -2763,6 +2996,9 @@ class BigQmtXtTrader:
             order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
             traded_volume=_safe_int(item.get("traded_volume")),
             price=_safe_float(item.get("price")),
+            traded_price=_safe_float(
+                item.get("traded_price", item.get("avg_traded_price", item.get("m_dTradedPrice")))
+            ),
             order_sysid=order_sysid,
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),

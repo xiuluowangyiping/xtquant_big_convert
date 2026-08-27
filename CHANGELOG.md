@@ -2,6 +2,147 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.2.13] - 2026-08-27
+
+### 修复
+
+- **`account_type` 三个配置位置里两个静默失效**（Issue #92）：信用账户按 STOCK 查询**不会报错**——`get_trade_detail_data` 返回一行全 0 的资产。所以这个设置错了，表现就是「信用账户资产全是 0」，日志里没有任何线索。
+
+  三个看着都合理的位置，此前只有一个生效：
+
+  | 位置 | 修复前 |
+  |---|---|
+  | local config 里的 `BIGQMT_ACCOUNT_TYPE` | 生效 |
+  | `BIGQMT_REDIS_CONFIG["account_type"]` | **无人读取** |
+  | 改 `redis_rpc_runtime.py` 里的 `ACCOUNT_TYPE` | **被静默覆盖** |
+
+  第三条尤其阴：解析式是 `BIGQMT_ACCOUNT_TYPE or ACCOUNT_TYPE or "STOCK"`，而随包发的 example 配置里写着 `BIGQMT_ACCOUNT_TYPE = "STOCK"`——它是真值，永远赢，所以改文件里那个常量等于白改。报告人用的正是后两条。
+
+  后两个位置现在都认（按上表优先级），并且**解析结果在启动时打印、说明来源**，冲突会指名：
+
+  ```
+  [bigqmt_shell] account_type=CREDIT (from BIGQMT_REDIS_CONFIG['account_type'])
+  [bigqmt_shell] ignored conflicting account_type from: BIGQMT_ACCOUNT_TYPE
+  ```
+
+  模块常量出厂即 `"STOCK"`，因此只有被改动过才算用户的选择——否则每个信用部署都会报一条与它的假冲突。
+
+  **需要说清楚哪部分本来就没坏**：`account_type` 一旦解析出来，确实能正确到达 `get_trade_detail_data(account, 'CREDIT', 'ACCOUNT')`。新增 10 个测试中有 2 个覆盖该链路，它们在修复前的代码上也通过；另外 8 个会红。
+
+### 已验证
+
+- **PR #82 的 `traded_price` 拿到实盘证据**（0.2.11、0.2.12 两版的已知限制，现已解除）：实盘 18 笔委托、14 笔成交，逐笔核对——
+
+  ```
+  traded_price 与 price 不同的:  9 笔    (最大差 10.56)
+  两者相同的:                    5 笔    (限价单按报价成交)
+  已成交但 traded_price 为 0 的:  0 笔    (修复前应为全部 14 笔)
+  ```
+
+  证明 `traded_price` 是真实成交均价，而非 `price` 的副本。
+
+### 已知限制
+
+- **信用委托类型仍会被塌缩成普通买卖**：PR #88 试图修此问题，但其映射把 `33` / `34` 认成了专项融资买入/专项融券卖出——那两个实际是 `OPT_OPTION_SELL_CLOSE` / `OPT_OPTION_SELL_OPEN`（期权操作），专项信用是 `40` / `41`；另缺 9 个信用类型，含最基本的 `28 CREDIT_SLO_SELL`。已请求修改，本版未合入。
+- **#92 的信用账户表现未实盘确认**：本机为股票账户，**无信用账户可验证「资产不再全 0」**。本版修的是配置发现与可见性，该部分完全由测试钉住，并已部署 QMT 重启验证（日志首次打印 `account_type=STOCK (from default)`，与股票账户未设置的预期一致，回归 6/6 PASS）。请 @jerry87n 在信用账户上复测。
+- **`can_close_vol` 在股票账户上返回 LLONG_MAX 哨兵值**（Issue #84）。
+- **单文件构建需要源码检出**：`tools/` 不随 wheel/sdist 分发；目标沙箱环境未在本机复现（本机 QMT 不拒绝 `import redis`），真实加载由 @heimo88 实测。
+- **PR #81 的接口尚未补全**：`EmptyPositionProvider` 与 `PositionProvider` 协议均缺 `get_position_statistics`。
+- **#77**（同终端双账户）属当前设计。**#78** 待报告人补充环境信息。
+
+---
+
+## [0.2.12] - 2026-08-27
+
+### 新增
+
+- **`bigqmt-init` 配置向导**：部署此前意味着抄两份 `.example.py`、搞清楚三十来个键里哪些真的要改、还要手工保证服务端和客户端两边一致。向导只问会变的那几项——账号、账号类型、传输方式、地址端口、Redis 凭据、是否允许远程下单、部署方式——然后**从同一组答案**生成两份配置，所以它们不可能在连接参数上对不上。选单文件部署时顺带跑对应生成器并把配置烘焙进产物，替换掉占位符。
+
+  三项不问、直接定死：`rpc_background_threads` 恒为 `False`（`get_trade_detail_data` 离开主策略线程返回空，这不是可选项）；`rpc_allow_order_methods` 默认关，打开前明确说明含义；选无 redis 单文件会强制 `transport=zmq`，不会留下一份在无法 import redis 的文件里声称用 redis 的配置。
+
+  密码分两类：Redis 密码是服务凭据，写进配置文件（`.example.py` 本来就这么记的），输入不回显；**QMT 登录密码完全不落盘**——`qmt_launcher` 从 `BIGQMT_LOGIN_PASSWORD` 读，这样它不会出现在 `argv` 或磁盘文件里，向导沿用该约定并在结束时说明。
+
+- **单文件 QMT 构建生成器**（Issue #56，感谢 @heimo88）：部分券商的 QMT 是白名单 + 不能加载文件、不能 import 外部模块，只有把所有代码放进一个策略文件才能跑。`tools/build_single_file.py`（base64 内嵌）和 `tools/build_no_redis_single_file_flat.py`（明文真实代码，强制 zmq）把整个包打成一个自包含文件，运行时用自定义 import 钩子从内存解析。脚本由报告人在其券商环境实测通过。
+
+  合入时换掉了模板里夹带的提交者个人实盘配置（真实账号、`rpc_allow_order_methods=True`、`rpc_background_threads=True`、`full_tick_cache_enabled=True`），并补上两个模板都缺的 `BIGQMT_ACCOUNT_TYPE`（#68 加的）。产物已 `.gitignore`，用时重新生成。
+
+  flat 版把每个模块缩进进 `def _mod_N():` 再 exec——**正是让 `from X import *` 报 `SyntaxError: import * only allowed at module level` 的那个形状**。所以这个构建既依赖 0.2.11 对 #76 的修复，现在也成了它的回归守卫：整个测试套件里没有别的地方会把模块编译进函数体。
+
+### 修复
+
+- **负债合约查询少传一个参数**（PR #87，@ljjtim）：`get_unclosed_compacts` / `get_closed_compacts` 只传了 `accountID`，而 `docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md` 6.16 记载的签名是两参数、`accountType` 填 `'CREDIT'`。旁边三个单参数接口（`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract`）未受影响，与文档一致。
+
+- **`account_id is required` 说不清问题在哪**（Issue #90）：原来整条消息就一句 `Big QMT account_id is required`，**不说自己找过哪些模块**——所以「配置文件建了但放在当前解释器 import 不到的位置」和「压根没建配置文件」产生的报错一模一样。报告人其实已经建了那个文件。
+
+  现在区分两种成因（没有可导入的模块 / 模块导入了但没定义 `BIGQMT_ACCOUNT_ID`——后者去查 `sys.path` 是南辕北辙），列出三条已逐一实测的解法，并点出时序陷阱：`configure()` 在模块导入时就跑了一次，之后才放好的配置不会自动生效。构造这条消息本身不会抛异常——它跑在错误路径上。
+
+### 文档
+
+- **QMT Python 组件前置说明**（Issue #85）：全新安装的终端 `bin.x64\` 下没有 `Lib\` 目录，也没有 `python.exe`——那是 Python 组件带来的，不是终端自带的，不要手动创建。此前文档直接假设这些路径存在，还让往 `bin.x64\Lib\site-packages` 里拷包。
+- README 新增「配置向导」「单文件构建」两节；修正过期的常量计数（91 → 539，#73 之后）。
+
+### 已知限制
+
+- **信用委托类型仍会被塌缩成普通买卖**：PR #88 试图修这个，但其操作类型映射把 `33` / `34` 认成了专项融资买入/专项融券卖出——那两个实际是 `OPT_OPTION_SELL_CLOSE` / `OPT_OPTION_SELL_OPEN`（期权操作），专项信用是 `40` / `41`；另缺 9 个信用类型，含最基本的 `28 CREDIT_SLO_SELL`。已请求修改，本版未合入。
+- **`can_close_vol` 在股票账户上返回 LLONG_MAX 哨兵值**（Issue #84），沿自 0.2.11 的 #81。
+- **PR #82 的 `traded_price` 仍无实盘证据**（验证当日 0 笔委托），契约由单测钉住。
+- **单文件构建未在目标沙箱环境复现**：本机 QMT 不拒绝 `import redis`。生成、编译、配置正确性由测试钉住；受限券商环境里的真实加载由 @heimo88 实测（#76 已据此关闭）。
+- **PR #81 的接口尚未补全**：`EmptyPositionProvider` 与 `PositionProvider` 协议均缺 `get_position_statistics`。
+- **#77**（同终端双账户）属当前设计——每账户状态存放在模块级全局，两个实例共享 `sys.modules` 即互相覆盖。**#78** 待报告人补充环境信息。
+
+---
+
+## [0.2.11] - 2026-08-27
+
+### 新增
+
+- **`query_position_statistics` 持仓统计**（PR #81，@ReCodeLife）：对齐 MiniQMT 同名接口，服务端经 `get_trade_detail_data(..., "POSITION_STATISTICS")` 提供，43 个字段同时给出 snake_case 与 `m_` 两套名字。正确加入主线程方法名单——`get_trade_detail_data` 离开主线程返回空。**实盘验证推翻了 PR 描述的一个前提**：该接口在**股票账户**上也返回数据，不限期货。6 个持仓逐行核对：`position` 与 `query_stock_positions` 的持仓量 **6/6 完全一致**，8 组 `m_` 别名与 snake_case 全部吻合，17/43 字段有值（其余 26 个是期货专属的保证金/权利金字段，股票账户为空属正常）。
+- **委托回调带成交均价**（PR #82，@yuchiwang）：`traded_price`（成交均价）本就是原生 `XtOrder` 字段，但桥从未填充，导致 `on_stock_order` 在已成时拿不到成交价。服务端查询路径、回调 normalize、客户端 `_order_from_dict` 四层补齐并各带测试。提交者已实盘验证。
+
+### 修复
+
+- **单文件 QMT 沙箱构建无法加载：`from xtquant.xtconstant import *` 是语法错误**（Issue #76）：单文件构建把每个模块塞进函数体 exec，而 `import *` 只允许在模块级，报 `SyntaxError: import * only allowed at module level`。这是 0.2.10 里 #73 引入的——它删掉 `xtquant_compat` 中 110 个硬编码常量、改用 `import *` 兜住。
+
+  **只导入实际用到的 3 个名字会修好语法、同时弄坏别的东西**：`import *` 拉进 534 个名字，模块自身只用 `ORDER_UNKNOWN` / `STOCK_BUY` / `STOCK_SELL`，但 `docs/XTQUANT_COMPAT_REPLACEMENT.md` 记载的「接入方式一」是 `from bigqmt_signal_trader import xtquant_compat as xtconstant`，即调用方从本模块读常量。改为显式循环回填，**539/539 全部保留**并逐个与来源比对。没有使用模块级 `__getattr__`：PEP 562 是 Python 3.7+，而 QMT 自带 3.6（`bin.x64/python36.dll`）；4 个混合大小写常量（含原生 SDK 拼写的 `OFFSET_FLAG_ClOSEYESTERDAY`）也排除了按 `.isupper()` 过滤的写法。
+
+- **回调线程上首次导入模块失败，回调推送全丢**（Issue #76）：`exec_events` 之前是在 order/deal 回调**内部**导入的。QMT 的这些回调跑在经 `PyGILState_Ensure` 进入的 C++ 线程上，在该线程上首次 exec 一个尚未导入的模块会在 C 层失败**且不设置 Python 异常**，表现为 `SystemError: error return without exception set`。普通包部署不触发（init 期的 reload 已把它预热进 `sys.modules`，惰性导入直接命中缓存）；单文件沙箱构建里那次 `import_module` 会失败并被 `except` 吞掉，于是真的在回调线程上首载。改为模块加载期导入，走已在服务适配器模块的同一个本地 loader。
+
+  同时修掉**让这个 bug 藏了一天的原因**：handler 只记 `str(exc)`，日志读出来就是 `error return without exception set` 然后没了。现在带异常类与完整堆栈。
+
+- **adjust 主线程上一个未受控的调试 `print`**（#81 跟进，4c7d1cb）：PR #81 夹带了一段与其功能无关的调试输出。该文件其余 `print` 均受 `debug_log_limit`（默认 0）控制，这一处没有，因而每个响应都执行；且对**完整** payload 做 `json.dumps` 后才截断到 2000 字符。实测一个典型 `get_market_data_ex` 响应（100 支 × 240 根）序列化 2.6MB 耗时约 **30ms**、丢弃 99.92%——而它运行在 adjust 主线程上，实测 `tick_app` 11500 次调用的最大值才 29–42ms、p99.98 在 5ms 以内。
+
+### 已知限制
+
+- **`can_close_vol` 在股票账户上返回 LLONG_MAX 哨兵值**（Issue #84）：实盘 6 个持仓全部返回 `2^63-1`，即 QMT 对股票账户「未设置」的哨兵，被原样透传成一个真实数字；而本仓库 API 参考把 `m_nCanCloseVol` 记为 int「可平」。映射代码本身忠实转换了 QMT 给的值，问题在于哨兵未被识别。**这只有实盘数据能发现**，单测与代码审查都看不出来。
+- **PR #82 的 `traded_price` 尚无实盘证据**：验证当日 0 笔委托，该字段需**有成交的委托**才能证明。契约与四层往返由单测钉住。
+- **Issue #76 两项未完成验证**：报告人的单文件构建脚本依赖两个从未附带的模块（同 #56），**该构建无法在此复现**——`import *` 一项是通过「将模块源码放入函数体编译」钉住的，已确认该检查在修复前的代码上复现了报告人所报的 SyntaxError，但这不等同于跑过其真实构建；真实回调投递需实际下单才触发。已请报告人复测。
+- **PR #81 的接口尚未补全**：`EmptyPositionProvider` 与 `PositionProvider` 协议均缺 `get_position_statistics`（实测 `AttributeError`，会降级为 RPC 错误响应，不会中断线程）。
+- **#77**（同终端双账户）：现为一策略实例对应一账户——`_account_id` / `_rpc_service` / `_quote_subscription_service` 等每账户状态存放在模块级全局，RPC 通道亦按账户模板化，两个实例共享 `sys.modules` 即互相覆盖。属当前设计，非缺陷。**#78** 待报告人补充环境信息。
+
+---
+
+## [0.2.10] - 2026-08-26
+
+### 修复
+
+- **zmq 部署收不到任何回调推送**（Issue #76）：order/trade 事件**两端都硬绑 Redis**——服务端 `_publish_exec_event` 建不出 Redis 客户端就直接 `return`，客户端 `_event_loop` 只订阅 Redis 频道。纯 zmq 部署因此完全收不到 `on_stock_order` / `on_stock_trade` / `on_order_error`，而且是**静默的**：客户端只是连不上然后无限重试，服务端把「没有 Redis」当正常跳过。现在 exec 事件复用已有的全推行情 PUB 通道（不新开端口），Redis 仍优先（其频道带 stream 可做短重放）。报告人读代码就把这个推了出来。
+- **adjust 每个 tick 都在新建 Redis 客户端**（PR #79）：`_pump_download_jobs` 每次运行都建一个新客户端，而它每个 tick 都跑——按 100ms 间隔就是**每秒 10 个**，每个带一套连接池。症状是 QMT 面板里的 `AttributeError: 'Redis' object has no attribute 'connection'`（redis-py 的 `__del__` 跑在构造未完成的对象上），一天 31 次。Python 把它吞成 `Exception ignored in`，所以**从没进过 `bigqmt.log`**。`_exec_event_redis` 早已为同样理由加过缓存，此处被漏掉；修复是复用同一个缓存 helper。
+- **一行无法解析的数据搞垮整个查询**（PR #70）：#73 让 `_full_code` 遇到柜台式交易所 ID 时抛异常——信号本身对，但三个调用方的行循环都无逐行保护，异常一路抛出 `get_positions` / `query_orders` / `query_trades`。一行异常 = 整个持仓查不到；`query_orders` 外层 `except` 返回 `[]`，丢的是全部委托。现在跳过该行、其余照常返回。
+- **xtquant / xtquant_compat 循环导入**（PR #74）：#73 反转常量依赖后，`xtquant/__init__` 急切加载的 `xtdata`/`xttrader` 又反向引用 `xtquant_compat`，环闭合——`import bigqmt_signal_trader` 直接失败、**27 个测试模块无法收集**。且**依赖导入顺序**（先 import xtquant 能过），这类 bug 平时测不出来。两个 shim 改为通过模块级 `__getattr__`（PEP 562）惰性解析；调用方三种写法（属性访问 / from-import / 子模块导入）全部逐项验证不变。
+
+### 变更（PR #73，@ReCodeLife）
+
+- **常量定义迁回 shim 侧**：`xtquant/xtconstant.py` 补全为完整实现（90 → 539 个），`xtquant_compat` 改为 `from xtquant.xtconstant import *` 并删去 142 行硬编码。对着 QMT 自带原生 SDK 逐个比对：**原生 90 个常量 0 个值被改动、0 个缺失**，新增 443 个券商扩展枚举。`xttype` 同步扩展。
+- **期货持仓代码解析**（PR #68，@ReCodeLife）：裸期货合约（交易所字段为迅投简称 DF/SF/ZF）此前被送进股票归一化并抛错。改为按交易所字段分类、不猜代码形状，并**保留符号原始大小写**（`rb2401.SF` 小写 / `AP401.ZF` 大写，不可互换）。新增 `BIGQMT_ACCOUNT_TYPE` 配置（默认 `STOCK`）。
+
+### 已知限制
+
+- **#79 的实盘验证不充分**：修复后线上 0 次，但**重启前也是 0 次**（问题出现在前一日），所以这个 0 不构成证据。行为由单测钉住（20 次调用 → 1 个客户端，还原即变红），实盘待自然复现。
+- **#76 的真实回调投递未验证**：已验证通道连通、格式正确、部署版代码端到端可投递（order/trade/order_error 三类），但真实回调需**实际下单**才触发，收盘后订阅收到 0 个事件属正常。
+- **#58 的期货小写代码仍缺实盘样本**；**#56 单文件构建**未进主干（报告人的脚本依赖两个未附带模块）；**#77 / #78** 待报告人补充信息。
+
+---
+
 ## [0.2.9] - 2026-08-24
 
 ### 修复

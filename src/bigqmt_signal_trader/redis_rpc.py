@@ -63,6 +63,7 @@ READ_METHODS = {
     "get_formula_result",
     "gen_factor_index",
     "get_positions",
+    "get_position_statistics",
     "get_asset",
     "query_orders",
     "query_trades",
@@ -125,6 +126,7 @@ LISTENER_DEFERRED_METHODS = {
     # data. Asset queries use the same QMT detail API and must follow this rule.
     "get_asset",
     "get_positions",
+    "get_position_statistics",
     "query_stock_position",
     "query_orders",
     "query_trades",
@@ -164,6 +166,7 @@ METHOD_ALIASES = {
     "getDividFactors": "get_divid_factors",
     "query_stock_asset": "get_asset",
     "query_stock_positions": "get_positions",
+    "query_position_statistics": "get_position_statistics",
     "query_stock_orders": "query_orders",
     "query_stock_trades": "query_trades",
     "order_stock": "submit_order",
@@ -599,6 +602,9 @@ class BigQmtRpcHandlers:
     def _handle_get_positions(self, params):
         return self.position_provider.get_positions(self._request_account_id(params))
 
+    def _handle_get_position_statistics(self, params):
+        return self.position_provider.get_position_statistics(self._request_account_id(params))
+
     def _handle_query_stock_position(self, params):
         stock_code = str(params.get("stock_code") or params.get("code") or "").strip()
         if not stock_code:
@@ -696,6 +702,11 @@ class BigQmtRpcHandlers:
         except Exception:
             return []
 
+    def _configured_account_type(self):
+        return str(
+            getattr(self.order_gateway, "account_type", "CREDIT") or "CREDIT"
+        ).strip().upper()
+
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
         """get_trade_detail_data with one of the 6 official detail types.
 
@@ -727,7 +738,11 @@ class BigQmtRpcHandlers:
 
     def _handle_query_stk_compacts(self, params):
         # 未平仓合约（负债）— 官方 get_unclosed_compacts
-        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_unclosed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_query_credit_subjects(self, params):
         # 融资标的（担保品）— 官方 get_assure_contract
@@ -790,10 +805,18 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_enable_short_contract", self._request_account_id(params))
 
     def _handle_get_unclosed_compacts(self, params):
-        return self._call_qmt_global("get_unclosed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_unclosed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_get_closed_compacts(self, params):
-        return self._call_qmt_global("get_closed_compacts", self._request_account_id(params))
+        return self._call_qmt_global(
+            "get_closed_compacts",
+            self._request_account_id(params),
+            self._configured_account_type(),
+        )
 
     def _handle_get_debt_contract(self, params):
         return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
