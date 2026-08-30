@@ -10,6 +10,7 @@ import json
 import time
 import uuid
 import queue as _queue
+from collections import OrderedDict as _OrderedDict
 import threading
 import importlib
 import datetime as _dt
@@ -28,6 +29,7 @@ from xtquant.xttype import StockAccount
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
+from .order_id import OrderId, order_sys_id_of
 from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
 
@@ -804,6 +806,9 @@ class BigQmtRpcClient:
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "payload": payload or {},
         }
+        # 显式地址且未启用 Redis discovery 的 ZMQ 是纯 ZMQ 模式，不应隐式连接 Redis。
+        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+            return event
         raw = json.dumps(event, ensure_ascii=False, default=str)
         stream_key = stream_template.format(account_id=account_id)
         redis_client = self._redis()
@@ -818,6 +823,9 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
+        # MySQL、SHM 和混合 ZMQ 继续保留既有 Redis subscription metadata 行为。
+        if self.transport_name == "zmq" and not bool(self.zmq_config.get("redis_discovery_enabled", False)):
+            return
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
         redis_client = self._redis()
@@ -862,6 +870,33 @@ def ipo_market_of(code):
     if text.startswith(_IPO_SZ_PREFIXES):
         return "SZ"
     return None
+
+
+MARKET_TOKENS = frozenset({"SH", "SZ", "BJ", "HK"})
+# Above this many explicit codes, one RPC's single timeout starts to matter more
+# than the extra payload of reading the exchange and filtering (issue #104).
+LARGE_CODE_LIST = 1000
+# What the fallback reads first. Stocks are 8.7% of an exchange listing, so
+# starting narrow is 1.08s against 7.4s; it widens to "all" only if that misses.
+DEFAULT_FALLBACK_TYPES = ("stock",)
+
+# How many int -> 合同编号 pairs a trader keeps so a cancel still resolves after
+# the caller round-tripped the id through JSON and lost the string (issue #113).
+_ORDER_ID_MEMORY = 4096
+
+
+def _markets_of(codes):
+    """Market tokens the given suffixed codes live on, or empty if any code
+    carries no recognised suffix -- filtering an exchange read cannot recover a
+    code we cannot place."""
+    markets = set()
+    for code in codes or []:
+        _, _, suffix = str(code).rpartition(".")
+        suffix = suffix.upper()
+        if suffix not in MARKET_TOKENS:
+            return set()
+        markets.add(suffix)
+    return markets
 
 
 def _full_tick_params(codes, types=None):
@@ -981,6 +1016,48 @@ class _BarPoller(object):
             self._stop.wait(self._interval)
 
 
+_VERSION_WARNED = {"shown": False}
+
+
+def warn_on_version_mismatch(ping_response):
+    """Warn once when the QMT-side bridge is not the build this client is.
+
+    Deploying into QMT is a file copy and QMT keeps modules across strategy
+    re-runs, so a stale server behaves like a fix that "did not work". Say so on
+    connect instead of leaving it to be discovered by debugging.
+
+    Silent when the versions agree, when the server is too old to report one, or
+    when it has already been said. Never raises: this is on the connect path.
+    """
+    if _VERSION_WARNED["shown"]:
+        return None
+    try:
+        server = str((ping_response or {}).get("version") or "")
+        if not server:
+            return None      # server predates version reporting; nothing to compare
+        from .version import __version__ as local
+
+        if server == local:
+            return None
+        _VERSION_WARNED["shown"] = True
+        log.warning(
+            "version mismatch: this client is %s, the QMT-side bridge is %s. "
+            "A copy alone does not take effect -- QMT keeps modules across "
+            "strategy re-runs, so the strategy must be restarted too. Set "
+            "BIGQMT_AUTO_SYNC=1 (or call xt_trader.sync_deployment()) to push "
+            "this client's package into the QMT python directory.",
+            local, server)
+        return (local, server)
+    except Exception:
+        return None
+
+
+def auto_sync_enabled():
+    """Writing into a live trading terminal is opt-in, not a side effect of
+    connecting."""
+    return _bool_value(os.environ.get("BIGQMT_AUTO_SYNC"), False)
+
+
 class BigQmtXtData:
     def __init__(self, client):
         self.client = client
@@ -1053,7 +1130,96 @@ class BigQmtXtData:
             rpc_timeout = timeout_seconds
         else:
             rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
-        return self.client.call("get_full_tick", _full_tick_params(codes, types), timeout_seconds=rpc_timeout) or {}
+        try:
+            data = self.client.call(
+                "get_full_tick", _full_tick_params(codes, types),
+                timeout_seconds=rpc_timeout) or {}
+        except Exception:
+            data = None
+            if not self._can_fall_back_to_markets(codes, upper_codes):
+                raise
+        if self._should_fall_back(codes, upper_codes, data):
+            recovered = self._full_tick_via_markets(codes, rpc_timeout, types)
+            if recovered is not None:
+                return recovered
+            if data is None:
+                raise
+        return data or {}
+
+    def _can_fall_back_to_markets(self, codes, upper_codes):
+        """Only an explicit list of suffixed codes can be recovered this way."""
+        if upper_codes & MARKET_TOKENS:
+            return False          # already a whole-market request
+        if len(codes) <= LARGE_CODE_LIST:
+            return False          # small list: a failure here is a real failure
+        return bool(_markets_of(codes))
+
+    def _should_fall_back(self, codes, upper_codes, data):
+        if data is None:
+            return True           # the request raised
+        if not self._can_fall_back_to_markets(codes, upper_codes):
+            return False
+        # Short answer: the server dropped codes, or truncated. Anything missing
+        # is worth one whole-market read rather than silently returning less
+        # than was asked for (issue #104).
+        return len(data) < len(set(str(c) for c in codes))
+
+    def _full_tick_via_markets(self, codes, rpc_timeout, types=None):
+        """Read the exchange(s) these codes live on, then filter to them.
+
+        A long explicit list is one RPC carrying one timeout, so it either fits
+        or loses everything; a market token is a single cheap argument that
+        cannot truncate.
+
+        Narrowed first, "all" only if that came up short. An exchange listing is
+        mostly bonds -- "SH" is 26744 instruments of which 2315 are stocks -- so
+        reading all of it costs 7.4s against 1.08s for the stocks. No reason to
+        pay that when the codes being recovered are stocks (issue #104).
+        """
+        markets = _markets_of(codes)
+        if not markets:
+            return None
+        wanted = set(str(code) for code in codes)
+
+        attempts = [list(types) if types else list(DEFAULT_FALLBACK_TYPES)]
+        if not any(str(k).lower() == "all" for k in attempts[0]):
+            attempts.append(["all"])
+
+        merged = {}
+        for attempt in attempts:
+            merged = {}
+            try:
+                for market in sorted(markets):
+                    snapshot = self.client.call(
+                        "get_full_tick", _full_tick_params([market], attempt),
+                        timeout_seconds=max(rpc_timeout or 0, 60)) or {}
+                    for key, value in snapshot.items():
+                        if str(key) in wanted:
+                            merged[key] = value
+            except Exception:
+                return None
+            if len(merged) >= len(wanted):
+                break          # everything asked for; no need to widen
+
+        log.warning(
+            "get_full_tick: %d codes did not come back directly; re-read %s as "
+            "%s and filtered to %d. A market token with types= is cheaper than "
+            "a list this long.",
+            len(wanted), "/".join(sorted(markets)), "/".join(attempts[-1]
+                                                             if len(merged) < len(wanted)
+                                                             else attempts[0]),
+            len(merged))
+        return merged
+
+    def get_deployment_info(self):
+        """Where the QMT-side bridge is running from, and which build it is.
+
+        Returns version / package_dir / qmt_python_dir / strategy_dir /
+        python_version. Use it to check a deploy landed before hunting for a
+        fix that was never actually there -- QMT keeps modules across strategy
+        re-runs, so a forgotten copy and an un-reloaded one look the same.
+        """
+        return self.client.call("get_deployment_info", {}) or {}
 
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
@@ -1102,9 +1268,9 @@ class BigQmtXtData:
 
     def _get_market_data_ex_batch(self, params, timeout_seconds=None):
         """One RPC's worth of bars, healed and normalized. No caching."""
-        data = self._call("get_market_data_ex", timeout_seconds=timeout_seconds, **params)
+        data = self.client.call("get_market_data_ex", params, timeout_seconds=timeout_seconds)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data)
+        data = self._heal_adjusted("get_market_data_ex", params, data, timeout_seconds=timeout_seconds)
         # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
         if isinstance(data, dict):
             data = _normalize_market_data_result(data, field_list=params.get("field_list"))
@@ -1308,7 +1474,7 @@ class BigQmtXtData:
         except Exception:
             pass
 
-    def _heal_adjusted(self, method, params, data, wait_seconds=2.0):
+    def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
         """Self-heal adjusted reads: if the adjusted pull came back all-zero,
         trigger a server-side raw download, wait for async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
@@ -1326,6 +1492,8 @@ class BigQmtXtData:
             params.get("end_time", ""),
         )
         time.sleep(wait_seconds)
+        if timeout_seconds is not None:
+            return self.client.call(method, params, timeout_seconds=timeout_seconds)
         return self._call(method, **params)
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
@@ -1613,6 +1781,7 @@ class BigQmtXtData:
                     count=-1,
                     dividend_type=dividend_type,
                     fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
+                    timeout_seconds=float(data_wait_seconds),
                 )
                 ready = 0
                 for code in batch:
@@ -2012,6 +2181,8 @@ class BigQmtXtTrader:
         self._async_order_queue = _queue.Queue()
         self._async_order_thread = None
         self._async_order_lock = threading.Lock()
+        # int -> 合同编号 for ids handed out as OrderId (issue #113).
+        self._order_sys_ids = _OrderedDict()
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -2059,9 +2230,47 @@ class BigQmtXtTrader:
 
     def connect(self):
         if self.client.account_id:
-            self.client.call("ping")
+            mismatch = warn_on_version_mismatch(self.client.call("ping"))
+            if mismatch and auto_sync_enabled():
+                self.sync_deployment()
         self._fire_account_status()
         return 0
+
+    def sync_deployment(self, dry_run=False):
+        """Push this client's package into the QMT python directory.
+
+        The copy runs here, not inside QMT: a trading process rewriting its own
+        code mid-session would put whatever is in the source tree, half-finished
+        edits included, straight onto the live terminal.
+
+        Config files are never written. The strategy still has to be restarted
+        afterwards -- QMT keeps modules in sys.modules across re-runs, so a copy
+        on its own changes nothing.
+        """
+        from .sync import sync_deployment as _sync
+
+        info = self.get_deployment_info()
+        target = info.get("qmt_python_dir") or ""
+        if not target:
+            log.warning("sync_deployment: the bridge did not report a "
+                        "qmt_python_dir (server too old?); nothing copied")
+            return {"updated": [], "error": "no qmt_python_dir reported"}
+
+        result = _sync(target, dry_run=dry_run)
+        if result.get("error"):
+            log.warning("sync_deployment: %s", result["error"])
+        elif result["updated"]:
+            log.warning(
+                "sync_deployment: %d file(s) %s in %s. RESTART THE STRATEGY -- "
+                "QMT keeps modules across re-runs, so this has no effect until "
+                "you do. Config files untouched: %s",
+                len(result["updated"]),
+                "would be updated" if dry_run else "updated",
+                target, ", ".join(result["skipped_config"]) or "none present")
+        else:
+            log.info("sync_deployment: already up to date (%d files identical)",
+                     result["identical"])
+        return result
 
     def subscribe(self, account):
         if not self.client.account_id:
@@ -2605,7 +2814,60 @@ class BigQmtXtTrader:
             account, stock_code, order_type, order_volume, price_type,
             price, strategy_name, order_remark,
         )
-        return data.get("order_sys_id") or -1
+        return self._order_id(data.get("order_sys_id"))
+
+    def _order_id(self, order_sys_id):
+        """MiniQMT's return contract: a positive int, or -1 on failure.
+
+        Big QMT only has the broker's 合同编号 string, so an OrderId carries
+        both (issue #113). "-1" arrives as a *string* from the server when the
+        submit itself failed, and used to be returned as one -- truthy, and
+        never equal to -1, so a rejected order read as success.
+        """
+        text = str(order_sys_id or "").strip()
+        if not text or text == "-1":
+            return -1
+        order_id = OrderId(text)
+        self._remember_order_id(order_id)
+        return order_id
+
+    def _order_object_id(self, order_sys_id):
+        """``order_id`` for an XtOrder / XtTrade: int, empty stays empty.
+
+        Unlike the order_stock return there is no -1 here -- a query result
+        either has an id or does not.
+        """
+        text = str(order_sys_id or "").strip()
+        if not text:
+            return OrderId("")
+        order_id = OrderId(text)
+        self._remember_order_id(order_id)
+        return order_id
+
+    def _remember_order_id(self, order_id):
+        """Keep int -> 合同编号 so a cancel still works after a round trip.
+
+        A caller who stores the id in JSON or a database gets a plain int back,
+        losing the string half. Bounded: this is a convenience, not a ledger.
+        """
+        sys_id = getattr(order_id, "order_sys_id", "")
+        if not sys_id or str(int(order_id)) == sys_id:
+            return                       # nothing to remember: they agree
+        table = self._order_sys_ids
+        table[int(order_id)] = sys_id
+        while len(table) > _ORDER_ID_MEMORY:
+            table.popitem(last=False)
+
+    def _resolve_order_sys_id(self, value):
+        """The broker string for whatever a caller passed to a cancel."""
+        carried = getattr(value, "order_sys_id", None)
+        if carried:
+            return str(carried)
+        if isinstance(value, int) and not isinstance(value, bool):
+            remembered = self._order_sys_ids.get(int(value))
+            if remembered:
+                return remembered
+        return order_sys_id_of(value)
 
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
@@ -2795,7 +3057,7 @@ class BigQmtXtTrader:
                             error_msg=str(exc),
                             order_sysid="",          # MiniQMT 规范名 (issue #65)
                             order_sys_id="",
-                            order_id="",
+                            order_id=self._order_object_id(""),   # int (#113)
                             stock_code=stock_code,
                             seq=seq,
                             order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
@@ -2826,7 +3088,7 @@ class BigQmtXtTrader:
                             error_msg="order submit failed (order_stock returned -1)",
                             order_sysid="",          # MiniQMT 规范名 (issue #65)
                             order_sys_id="",
-                            order_id="",
+                            order_id=self._order_object_id(""),   # int (#113)
                             stock_code=stock_code,
                             seq=seq,
                             order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
@@ -2862,7 +3124,7 @@ class BigQmtXtTrader:
                     CompatObject(
                         account_id=self.client.account_id,
                         seq=seq,
-                        order_id=order_sys_id or user_order_id,
+                        order_id=self._order_object_id(order_sys_id or user_order_id),
                         order_sysid=order_sys_id,    # MiniQMT 规范名 (issue #65)
                         order_sys_id=order_sys_id,
                         stock_code=stock_code,
@@ -2931,17 +3193,25 @@ class BigQmtXtTrader:
         ) or []
 
     def cancel_order_stock_sysid(self, account, market, order_sysid):
+        """MiniQMT contract: 0 on success, -1 on failure (issue #113).
+
+        This returned a bool, which is worse than a type mismatch -- it inverts
+        the meaning. ``if trader.cancel_order_stock(...) == 0`` is how MiniQMT
+        code checks success, and ``False == 0`` is True, so a *failed* cancel
+        read as a successful one while a successful one read as failed.
+        """
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "cancel_order_stock_sysid",
             {
                 "account_id": account_id,
                 "market": market,
-                "order_sysid": order_sysid,
+                # Send the broker's own 合同编号, not the int we derived from it.
+                "order_sysid": self._resolve_order_sys_id(order_sysid),
             },
             account_id=account_id,
         ) or {}
-        return bool(data.get("success", data))
+        return 0 if bool(data.get("success", data)) else -1
 
     def cancel_order_stock(self, account, order_id):
         return self.cancel_order_stock_sysid(account, "", order_id)
@@ -3223,7 +3493,9 @@ class BigQmtXtTrader:
         # MiniQMT: returns seq, result comes back via on_cancel_order_stock_async_response.
         seq = self._next_async_seq()
         try:
-            ok = self.cancel_order_stock(account, order_id)
+            # 0 == success now (MiniQMT contract, issue #113), so a bare
+            # truthiness test on the return would read backwards.
+            ok = self.cancel_order_stock(account, order_id) == 0
         except Exception as exc:
             callback = self.callback
             if callback is not None:
@@ -3234,7 +3506,7 @@ class BigQmtXtTrader:
                             error_msg=str(exc),
                             order_sysid=str(order_id or ""),
                             order_sys_id=str(order_id or ""),
-                            order_id=str(order_id or ""),
+                            order_id=self._order_object_id(order_id),
                             stock_code="",
                         )
                     )
@@ -3255,7 +3527,7 @@ class BigQmtXtTrader:
                         error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sysid=str(order_id or ""),
                         order_sys_id=str(order_id or ""),
-                        order_id=str(order_id or ""),
+                        order_id=self._order_object_id(order_id),
                     ),
                 )
             except Exception:
@@ -3267,7 +3539,7 @@ class BigQmtXtTrader:
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
         seq = self._next_async_seq()
         try:
-            ok = self.cancel_order_stock_sysid(account, market, order_sysid)
+            ok = self.cancel_order_stock_sysid(account, market, order_sysid) == 0
         except Exception as exc:
             callback = self.callback
             if callback is not None:
@@ -3278,7 +3550,7 @@ class BigQmtXtTrader:
                             error_msg=str(exc),
                             order_sysid=str(order_sysid or ""),
                             order_sys_id=str(order_sysid or ""),
-                            order_id=str(order_sysid or ""),
+                            order_id=self._order_object_id(order_sysid),
                             stock_code="",
                         )
                     )
@@ -3299,7 +3571,7 @@ class BigQmtXtTrader:
                         error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sysid=str(order_sysid or ""),
                         order_sys_id=str(order_sysid or ""),
-                        order_id=str(order_sysid or ""),
+                        order_id=self._order_object_id(order_sysid),
                     ),
                 )
             except Exception:
@@ -3334,7 +3606,10 @@ class BigQmtXtTrader:
                 item.get("traded_price", item.get("avg_traded_price", item.get("m_dTradedPrice")))
             ),
             order_sysid=order_sysid,
-            order_id=order_sysid or str(item.get("user_order_id") or ""),
+            # MiniQMT: order_id is the int 委托编号, order_sysid the string
+            # 柜台编号. Both, from one 合同编号 (issue #113).
+            order_id=self._order_object_id(
+                order_sysid or str(item.get("user_order_id") or "")),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
             # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
@@ -3343,6 +3618,7 @@ class BigQmtXtTrader:
             order_time=_safe_int(item.get("order_time") or item.get("created_at_ts"), 0),
             # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
             status_msg=str(item.get("status_msg") or ""),
+            price_type=item.get("price_type"),
         )
 
     def _trade_from_dict(self, account_id, item):
@@ -3361,7 +3637,7 @@ class BigQmtXtTrader:
             stock_code=_full_a_share_code(item.get("stock_code")),
             order_type=order_type,
             order_sysid=order_sysid,
-            order_id=order_sysid,
+            order_id=self._order_object_id(order_sysid),
             trade_id=trade_id,
             # MiniQMT 字段契约: traded_id/traded_time 是业务代码读取的名字。
             traded_id=trade_id,

@@ -329,7 +329,12 @@ class OrderRequest:
         price_type,
         strategy_name,
         remark="",
+        order_type=None,
     ):
+        # MiniQMT-style order_type (xtconstant). Only set for operations a
+        # BUY/SELL action cannot express -- credit financing, repayment and the
+        # special-margin family. None means an ordinary stock order.
+        self.order_type = order_type
         self.signal_id = signal_id
         self.account_id = account_id
         self.action = action
@@ -365,6 +370,7 @@ class OrderSnapshot:
         order_time=0,
         status_msg="",
         traded_price=0.0,
+        price_type=None,
     ):
         self.order_sys_id = order_sys_id
         self.user_order_id = user_order_id
@@ -384,6 +390,8 @@ class OrderSnapshot:
         # 柜台的拒单理由只在这里, 例如
         # "[COUNTER] 资金可用余额不足，尚需[4789.630]" (issue #60)。
         self.status_msg = status_msg
+        # 完整 QMT 的不同版本可能不提供 price_type；追加在末尾保持旧位置参数兼容。
+        self.price_type = price_type
 
 
 class TradeSnapshot:

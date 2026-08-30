@@ -2,6 +2,140 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [Unreleased]
+
+### 新增
+
+- **能力探测 RPC `probe_capabilities`**：只读探查当前部署暴露了哪些 QMT callable——运行时全局函数绑定（passorder/download/信用等 20 项）、ContextInfo 方法存在性、信用接口只读试调（行数/报错）。部署后跑一次即可确认这台券商 QMT 的能力边界。参考 cfquant 的 credit probe 思路。
+- **docs/DEPLOY_QUICKSTART.md**：单账号部署最短路径（5 步 + 部署期常见问题表），README 快速开始入口挂载。
+- **docs/LATENCY_REPORT.md**：延迟报告独立成文（传输层对比、FormulaServer 直连、下单链路各环节、方法论声明）。
+
+### 修复
+
+- **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
+
+## [0.3.1] - 2026-08-30
+
+### 修复
+
+- **信用委托类型被塌缩成普通买卖**（Issue #103）：`order_stock(acc, code, 27, ...)` 返回「不支持该类型」。有两层，第二层更危险：
+
+  - RPC 只认 `23` / `24`，其余一律 `action or order_type is required`
+  - 即使放行也没用——`submit()` 按 action 映射 opType，`BUY` 恒等于 `23`，**融资买入会被当成普通买入下出去**。一笔真实的、但下错品种的委托，比直接报错危险得多。
+
+  数值本身是陷阱。MiniQMT 的 `order_type`（`xtconstant`）与 `passorder` 的 `opType` 是**两套编号**：
+
+  | 含义 | xtconstant | passorder opType（API 参考 10.1） |
+  |---|---|---|
+  | 融资买入 … 直接还款 | 27–32 | 27–32（相同） |
+  | 担保品买入 / 卖出 | — | 33 / 34 |
+  | **专项两融** | **40–45** | **70–75** |
+
+  所以 `40` 原样转发会到达 `passorder` 的**期货组合开多**。翻译不是可选项。
+
+  所有数值**按常量名取自 `xtconstant`**，不写字面量——PR #88 正是把它们写成字面量、测试又编码了同一个错误前提，因而全绿而映射是错的。另有一条测试：`xtconstant` 若新增未覆盖的 `CREDIT_` 常量即变红，新类型是可见缺口而非静默透传。
+
+  `直接还款`（32 / 45）移动现金而非证券，**没有买卖方向**——不猜，报错要求显式传 `action`。
+
+- **长代码列表失败时全丢**（Issue #104）：一次 RPC 只带一个超时，装不下的列表不是降级而是全部丢失。实测 1000 个 0.42s、10000 个 2.87s、26744 个超时；报告人在 1000 附近就撞上——超时的落点取决于机器。
+
+  现在长列表**失败或返回不全**时，改用市场令牌重读并筛选。重读**先窄后宽**：先按 `stock`（或调用方给的 `types=`）读（1.08s），不够才退到 `all`（7.4s）。
+
+  做成兜底而非阈值切换：1000 个代码直接请求 0.42s，整市场 7.4s，无条件切换会把本来正常的请求拖慢 17 倍。短列表失败仍然抛出（小列表失败是桥坏了，不是尺寸问题）、短列表返回不全不重读（停牌/退市/未订阅本来就会缺）、无可识别后缀的代码不重读。
+
+- **版本标记停在 0.2.16**：`pyproject` 与 CHANGELOG 已是 0.3.0，`version.py` 未跟上，于是 0.3.0 的部署把自己**报告成 0.2.16**——#103 的报告人正是照着这个数字确认版本的。`tests/test_version_stamp.py` 本就为此而写。
+
+### 已知限制
+
+- **信用委托未实盘验证**：会下真实的融资融券委托，本机无信用账户。@fengzhizialex 已表示可代为验证。
+- **长列表兜底未实盘验证**：触发条件（超时、返回不全）均为单测模拟。
+- **PyPI 曾落后于 GitHub**：0.2.10 到 0.2.15 只发了 GitHub Release、未上传 PyPI，那段时间 `pip install --upgrade` 取到的一直是 0.2.9。0.3.1 已上传。
+- 其余同 0.3.0。
+
+---
+
+## [0.3.0] - 2026-08-29
+
+### 新增
+
+- **纯 ZMQ 编辑器入口 `BIGQMT_ZMQ_DRYRUN.py`**（PR #108，@amigobot）：无 redis 部署（券商白名单沙箱）专用入口，强制 ZMQ + 后台线程，自动关闭 redis 依赖功能（download_jobs/exec_events/full_tick_cache）；bootstrap 失败写入 `logs/bigqmt-bootstrap-error.log`。能力边界（无执行回报推送）已在 README 注明。
+- **精简 QMT Python 兼容 fallback**：部分券商 python36.zip 裁掉 `importlib` / `logging`——REDIS_DRYRUN 注册最小 importlib 替代模块，logging_setup 降级为手写文件+stdout logger。
+- **`OrderSnapshot.price_type`**：委托快照透出报价类型（m_nOrderPriceType），并补 `traded_price`；shim 新增 `xtdata.get_stock_type` 转发。
+
+### 修复
+
+- **纯 ZMQ 模式隐式连 Redis**（PR #108）：`publish_event`/`save_quote_subscription` 在无 redis discovery 的纯 ZMQ 下直接跳过，不再隐式建 redis 连接。
+- **日线缓存日期窗口全滤光**（PR #108）：缓存为 8 位日期轴而调用方传 14 位 start_time 时字符串比较清空全部数据，现在按缓存轴精度对齐下限。
+- **timeout_seconds 被吞**（PR #108）：`get_market_data_ex` 批处理与复权自愈重试路径上超时参数被丢弃，现全程透传。
+- **交易日 ContextInfo fallback 用错首参**（PR #108）：SH/SZ 市场码被当证券代码传入，改为映射代表指数（000001.SH/399001.SZ）。
+
+## [0.2.16] - 2026-08-29
+
+纯新增，无破坏性变更。
+
+### 新增
+
+- **部署版本检测**：部署到 QMT 是文件拷贝，而 QMT 跨策略重跑保留 `sys.modules`——所以「忘了拷」和「拷了但没被加载」**从外部看完全一样**，此前只能靠比对文件字节和找行为变化来判断。
+
+  启动日志现在会说明实际加载的是哪个构建：
+
+  ```
+  [bigqmt_shell] bigqmt_signal_trader 0.2.16 loaded from D:\...\python\bigqmt_signal_trader
+  ```
+
+  同一信息开放为 RPC：
+
+  ```python
+  xtdata.get_deployment_info()
+  # {'version': '0.2.16', 'package_dir': ..., 'qmt_python_dir': ...,
+  #  'strategy_dir': ..., 'python_version': '3.6.8'}
+  ```
+
+  `ping` 响应也带上了 `version`，客户端连接时若与自身版本不一致会**告警一次**，并说明拷贝之后仍需重启策略。
+
+- **部署同步 `sync_deployment()`**：把客户端的包推到 QMT 的 python 目录，目标目录取自 `get_deployment_info()`，**不必硬编码路径**。
+
+  ```python
+  xt_trader.sync_deployment(dry_run=True)   # 先看会动哪些文件
+  xt_trader.sync_deployment()               # 真同步
+  ```
+
+  设 `BIGQMT_AUTO_SYNC=1` 后，连接时检测到版本不一致会自动同步。**默认关闭**——往实盘终端写文件不该是「连接」的副作用，源码树里若有半成品会直接进实盘。
+
+  | 行为 | 说明 |
+  |---|---|
+  | **绝不写入配置文件** | `bigqmt_signal_trader_local_config.py` / `bigqmt_signal_trader_client_config.py` 存账号与凭据；对应 `.example.py` 属文档，会更新 |
+  | **不新增顶层文件** | 只刷新部署已有的模块，加上策略入口（全新部署需要） |
+  | **覆盖前备份** | 留 `.bak_<时间戳>` |
+  | **原子写入** | 先写临时文件再替换，中断不会留下半个模块 |
+
+  **同步逻辑跑在客户端，不在 QMT 内。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西——包括改到一半的——直接送上实盘。每次结果都带 `restart_required`：拷贝本身不生效，必须重启策略。
+
+### 修复
+
+- **`__version__` 卡在 `0.2.0` 已十五个版本**，因而无法回答上述任何问题。现跟随 `pyproject.toml`，由测试钉住，并要求 `CHANGELOG` 中存在对应条目。
+
+- **版本标记移出 `__init__.py`**：QMT 沙箱的加载器**从不执行根包**——它建一个空模块直接返回，因为根包的 eager exports 会撞 QMT 的导入白名单：
+
+  ```python
+  # QMT native allowlist rejects the root package eager exports.
+  if name == "bigqmt_signal_trader":
+      return module
+  ```
+
+  所以 `__init__.py` 里定义的东西**在 QMT 里不存在**——在所有测试环境都正常，唯独在它唯一需要生效的地方是隐形的。第一版正是放在那里，实盘返回 `AttributeError: module 'bigqmt_signal_trader' has no attribute 'deployment_report'`。现位于 `version.py` 子模块，测试钉住放置位置与导入写法。
+
+### 实盘验证
+
+部署 + 重启后：启动版本行出现；`get_deployment_info` 返回的版本与本地包一致；同步真跑一次——更新 3 个文件、跳过 51 个相同文件、**两个配置文件字节未变**、二次运行报告无操作。
+
+### 已知限制
+
+- **同步之后仍需手动重启策略**，无法从外部触发（`qmt_launcher` 的 `restart` 路径从未在真实环境执行过）。
+- 其余同 0.2.15：本终端无期货行情权限、推送通道不可达的部署未验证、PR #88（信用委托类型）未合入、`can_close_vol` 哨兵值（#84）等。
+
+---
+
 ## [0.2.15] - 2026-08-29
 
 ### 破坏性变更

@@ -87,6 +87,7 @@ python -m bigqmt_signal_trader.init_config
 
 - `bigqmt_signal_trader.xtquant_compat`：把旧代码的 `xt_trader` / `xtdata` 调用转成 RPC，无需改业务代码。
 - 兼容 MiniQMT 方法名：`query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `get_full_tick` / `order_stock` 等。
+- 顶层 `xtquant.xtdata.get_stock_type(stock)` 显式转发到 RPC；完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
 - **完整 xtconstant 枚举**（539 个常量，涵盖原生 MiniQMT 全部 90 个，值逐一比对无改动）：账号类型、委托类型（股票/期货/信用/期权）、报价类型、委托状态、账号状态、`ORDER_TYPE_SET`。
 
 ```python
@@ -293,6 +294,59 @@ field_list=[open,high,low,close,volume,amount]
 **这不是可以自动优化掉的差距。** FormulaServer 只供那 6 列，其余 4 列返回 `NaN`，而 RPC 有真实值（实测 `preClose` 9.07 / 7.82 / 11.59，直连全部为 `nan`）。把默认路由到直连会静默把真实价格换成 `NaN`，所以默认保持走 RPC。
 
 **只要 OHLCV 就显式写出来**，那 30 倍就到手了。首次不传 `field_list` 时会在 `bigqmt.log` 记一条说明。
+
+### 版本检测与部署同步
+
+部署到 QMT 是**文件拷贝**，而 QMT 跨策略重跑保留 `sys.modules`。所以「忘了拷」和「拷了但没被加载」从外部看**一模一样**——这是本项目最容易浪费时间的一类问题：本地修好了，实盘却像没修。
+
+**启动时会打印实际加载的版本和目录：**
+
+```
+[bigqmt_shell] bigqmt_signal_trader 0.2.15 loaded from D:\...\python\bigqmt_signal_trader
+```
+
+**客户端可以直接问：**
+
+```python
+xtdata.get_deployment_info()
+# {'version': '0.2.15',
+#  'package_dir':    'D:\...\python\bigqmt_signal_trader',
+#  'qmt_python_dir': 'D:\...\python',
+#  'strategy_dir':   'D:\...\python',
+#  'python_version': '3.6.8'}
+```
+
+**版本不一致时，连接会告警：**
+
+```
+[WARNING] version mismatch: this client is 0.2.15, the QMT-side bridge is 0.2.9.
+A copy alone does not take effect -- QMT keeps modules across strategy re-runs,
+so the strategy must be restarted too. Set BIGQMT_AUTO_SYNC=1 (or call
+xt_trader.sync_deployment()) to push this client's package into the QMT python
+directory.
+```
+
+#### 同步
+
+```python
+xt_trader.sync_deployment(dry_run=True)   # 先看会动哪些文件
+xt_trader.sync_deployment()               # 真同步
+```
+
+目标目录来自 `get_deployment_info()`，**不必硬编码路径**。
+
+设环境变量 `BIGQMT_AUTO_SYNC=1` 后，连接时检测到版本不一致会自动同步。**默认关闭**——往实盘终端写文件不该是"连接"的副作用，源码树里若有半成品会直接进实盘。
+
+| 行为 | 说明 |
+|---|---|
+| **绝不写入配置文件** | `bigqmt_signal_trader_local_config.py` / `bigqmt_signal_trader_client_config.py` 存账号和凭据；对应的 `.example.py` 属文档，会更新 |
+| **不新增顶层文件** | 只刷新部署里已有的模块，加上策略入口（全新部署需要它）。否则 QMT 目录会变得没人说得清 |
+| **覆盖前备份** | 每个被覆盖的文件留 `.bak_<时间戳>` |
+| **原子写入** | 先写临时文件再替换，中断不会留下半个模块 |
+
+> **同步之后仍然必须手动重启策略。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+
+**同步逻辑跑在客户端，不在 QMT 里。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西（包括改到一半的）直接送上实盘。
 
 ### 可插拔传输层
 
@@ -571,6 +625,67 @@ credit_positions = credit_trader.query_stock_positions(credit_acc)
 
 ---
 
+## 与 MiniQMT 的兼容性对照
+
+本项目的目标是让照着 MiniQMT (`xtquant`) 写的代码不改就能跑。下表列出**返回值契约**——类型不对不会报错，只会让判断悄悄反过来，所以单独列出来。
+
+### 返回值：与 MiniQMT 一致
+
+| 接口 | 返回 | 说明 |
+|---|---|---|
+| `order_stock()` | `int` | 成功为正数，失败 `-1` |
+| `order_stock_async()` | `int` | 请求序号 seq，结果走 `on_order_stock_async_response` |
+| `cancel_order_stock()` | `int` | **`0` 成功，`-1` 失败**（不是 True/False） |
+| `cancel_order_stock_sysid()` | `int` | 同上 |
+| `cancel_order_stock_async()` | `int` | seq |
+| `connect()` / `start()` | `int` | `0` 成功 |
+| `subscribe()` / `unsubscribe()` | `int` | `0` 成功 |
+| `query_stock_asset()` | 对象 | `.cash` / `.total_asset` 等属性 |
+| `query_stock_positions()` | `list[对象]` | |
+| `query_stock_orders()` / `query_stock_trades()` | `list[对象]` | |
+| `subscribe_quote()` / `subscribe_whole_quote()` | `int` | 订阅号，传给 `unsubscribe_quote()` |
+| `get_full_tick()` | `dict` | `{code: {...}}` |
+| `get_market_data_ex()` | `dict[str, DataFrame]` | |
+
+### 订单号：既是 int 也是 str
+
+MiniQMT 的 `order_id` 是 int（委托编号），`order_sysid` 是 str（柜台合同编号）。大 QMT **没有前者**——`get_trade_detail_data` 只给 `m_strOrderSysID` 这个字符串。
+
+所以这里的 `order_id` 是一个 int 子类，两种形态同时成立：
+
+```python
+order_id = xt_trader.order_stock(acc, "600000.SH", 23, 100, 11, 10.0, "s", "")
+
+isinstance(order_id, int)   # True —— MiniQMT 写法照常
+order_id > 0                # True
+order_id == -1              # 失败时才 True
+
+str(order_id)               # '合同编号' —— 券商给的原始字符串
+xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符串
+```
+
+合同编号是纯数字时（多数券商），int 值就是那个数字，两种形态完全一致；不是纯数字时 int 是一个稳定的正数替身，而撤单、打印用的仍是真实编号。
+
+把 order_id 存进数据库再取出来（变成普通 int）也能撤单——客户端记着最近 4096 个的对应关系。想要字符串就用 `.order_sysid`，它一直是 str。
+
+同样的规则适用于 `XtOrder.order_id`、`XtTrade.order_id`，以及回调对象 `XtOrderError` / `XtCancelError` / `XtOrderResponse` 里的 `order_id`。
+
+### 行为差异（不是返回值，但会咬人）
+
+| 项目 | MiniQMT | 本项目 |
+|---|---|---|
+| `get_full_tick(["SH"])` | 全市场 | **默认只取股票**（1.08s）；要全部传 `types=["all"]`（7.4s，含地方债等 26744 只） |
+| `get_instrument_detail()` 查不到 | `None` | `{}`（两者都是 falsy，`if not detail` 通用） |
+| `download_history_data()` | 无返回 | 返回 `{"finished": n, "total": n}`（多给的信息，可忽略） |
+| 账户类型 | `StockAccount(id, "CREDIT")` 即可 | 还需服务端 `BIGQMT_ACCOUNT_TYPE = "CREDIT"`，**客户端的类型不会传到服务端** |
+| 委托类型常量 | `xtconstant.order_type` | 内部会翻译成 `passorder` 的 opType（两套编号，专项两融 40–45 → 70–75） |
+
+### 本项目的扩展（MiniQMT 没有）
+
+这些不是兼容项，是多出来的：`order_stock_result()`（返回完整 dict 而非单个 id）、`order_stock_batch()`、`wait_async_orders()`、`ipo_subscribe_all()`、`sync_deployment()`、`get_deployment_info()`、`query_execution_snapshot()`、`local_cache_stats()`。
+
+---
+
 ## 环境要求与依赖安装
 
 本系统分两部分，各自需要自己的 Python 环境和依赖：
@@ -654,6 +769,8 @@ cd D:\国金证券QMT交易端
 
 ## 快速开始
 
+> 第一次部署、只想要最短路径？直接看 [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md)（单账号五步跑通 + 常见问题表）。
+
 > 前置：客户端已按上面「A. 客户端」装好包；服务端按「B. 服务端」装好所选传输的依赖。下面是从零跑通整套流程的步骤。
 >
 > 只想把配置生成出来的话，跑 [`bigqmt-init`](#配置向导bigqmt-init) 即可——第 3 步的两份配置它会替你写好，选单文件部署还会顺带把构建也做了。
@@ -666,10 +783,13 @@ cd D:\国金证券QMT交易端
 src/bigqmt_signal_trader/          （整个核心包，含 transports/）
 src/bigqmt_signal_trader_strategy.py
 src/bigqmt_signal_trader_redis_rpc_runtime.py
-src/BIGQMT_REDIS_DRYRUN.py         （★ QMT 编辑器入口，GBK 编码，在 QMT 里加载这个）
+src/BIGQMT_REDIS_DRYRUN.py         （★ Redis/MySQL/SHM 等既有 transport 的 QMT 编辑器入口）
+src/BIGQMT_ZMQ_DRYRUN.py           （★ 同机 ZMQ 专用入口，强制 ZMQ 并记录 bootstrap 异常）
 ```
 
-> **在 QMT 策略编辑器里只加载 `BIGQMT_REDIS_DRYRUN.py` 一个文件**。它会自动 import 上面其余文件。其余 `.py`（`bigqmt_signal_trader_*`）是它依赖的模块，不是直接运行的入口。
+> 同机 ZMQ 在 QMT“模型研究”中新建 Python 模型并加载 `BIGQMT_ZMQ_DRYRUN.py`；其它 transport 继续使用 `BIGQMT_REDIS_DRYRUN.py`。ZMQ 入口只复用原入口的加载逻辑，不会创建 Redis client。
+>
+> **纯 ZMQ 模式的能力边界**：入口会自动关闭所有依赖 Redis 的功能——`download_jobs`（下载任务队列）、`exec_events`（`on_stock_order`/`on_stock_trade`/`on_order_error` 推送）、`full_tick_cache`（全市场快照缓存）。即纯 ZMQ 下**没有执行回报推送**，委托状态需主动 `query_stock_orders` 轮询。行情查询、下单/撤单、持仓查询等 RPC 全部正常。
 
 ### 第 2 步：创建 QMT 端私有配置
 
@@ -706,9 +826,9 @@ BIGQMT_REDIS_CONFIG = {
 
 > **重要**：切到 zmq 或 mysql 时，必须同时设 `"rpc_background_threads": True`（这两种传输用自己的后台线程，不走 QMT 回调 drain）。
 
-### 第 3 步：在 QMT 里运行策略（BIGQMT_REDIS_DRYRUN.py）
+### 第 3 步：在 QMT 里运行策略
 
-**入口文件是 `src/BIGQMT_REDIS_DRYRUN.py`**（GBK 编码，QMT 友好）。在 QMT 策略编辑器加载并运行它。
+同机 ZMQ 使用 `src/BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `src/BIGQMT_REDIS_DRYRUN.py`。两者都是 QMT 编辑器入口；ZMQ 入口会在正常 logger 初始化前失败时把 traceback 写入 `<QMT python>\logs\bigqmt-bootstrap-error.log`。部分券商 QMT 缺少标准 `importlib` 时，统一入口会注册仅包含 `import_module/reload` 的最小兼容模块。
 
 #### 这个文件做什么
 
@@ -754,7 +874,7 @@ def _known_qmt_python_dir():
 
 > **为什么是 GBK 编码？** QMT 的策略编辑器用本地代码页（中文 Windows 是 GBK）保存文件。文件头 `#coding:gbk` 声明编码，避免 QMT 保存时破坏 UTF-8 内容。源码本身是 ASCII（中文用 `chr()` 拼），所以实际不会乱码。
 
-> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。`BIGQMT_REDIS_DRYRUN.py` 是给 QMT 编辑器专用的外壳，处理了 QMT 进程不退出导致模块缓存、API 绑定等坑。在 QMT 里**只加载 `BIGQMT_REDIS_DRYRUN.py`**。
+> **为什么不直接用 `bigqmt_signal_trader_redis_rpc_runtime.py`？** 那个文件是纯逻辑入口，不包含 reload 和 QMT API 绑定。QMT 编辑器应加载与 transport 对应的外壳：同机 ZMQ 使用 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 使用 `BIGQMT_REDIS_DRYRUN.py`；不要直接加载 runtime 文件。
 
 ### 第 4 步：客户端调用
 
@@ -926,6 +1046,7 @@ src/xtquant/                       可选 xtquant import shim
 src/bigqmt_signal_trader_strategy.py        策略入口（init/handlebar/adjust + 启动诊断）
 src/bigqmt_signal_trader_redis_rpc_runtime.py  Redis RPC runtime 入口
 src/BIGQMT_REDIS_DRYRUN.py                  QMT 编辑器加载入口（GBK）
+src/BIGQMT_ZMQ_DRYRUN.py                    同机 ZMQ QMT 编辑器入口（GBK）
 src/BIGQMT_ZMQ_BACKTEST.py                  独立 QMT 回测 ZMQ 入口（GBK）
 src/bigqmt_backtest/                        独立历史驱动、模拟撮合、ZMQ 协议与客户端
 tests/bigqmt_signal_trader/        单元测试（无 QMT 环境可跑）
@@ -1090,7 +1211,7 @@ python qmt-trader/scripts/qmt.py snapshot --table
 
 与「快速开始」的客户端一致：
 
-1. QMT 端 RPC 服务已启动（`BIGQMT_REDIS_DRYRUN.py` 运行中，输出面板/日志看到启动诊断 OK）；
+1. QMT 端 RPC 服务已启动（同机 ZMQ 运行 `BIGQMT_ZMQ_DRYRUN.py`，其它 transport 运行 `BIGQMT_REDIS_DRYRUN.py`，输出面板/日志看到启动诊断 OK）；
 2. 客户端配置就绪——环境变量（`BIGQMT_ACCOUNT_ID` / `BIGQMT_REDIS_HOST` / `BIGQMT_REDIS_PORT` / `BIGQMT_REDIS_DB` / `BIGQMT_REDIS_PASSWORD`）或配置文件；
 3. 先 `ping` 确认连通：redis 约 13ms / zmq 约 0.7ms 为正常，超时说明 transport 或配置不匹配。
 
@@ -1138,6 +1259,8 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 ## 相关文档
 
 - [CHANGELOG.md](CHANGELOG.md) — **版本变更记录**（新增/修复/变更）
+- [docs/DEPLOY_QUICKSTART.md](docs/DEPLOY_QUICKSTART.md) — **单账号部署快速开始**（最短路径 + 部署期常见问题表）
+- [docs/LATENCY_REPORT.md](docs/LATENCY_REPORT.md) — **延迟测试报告**（传输层对比、FormulaServer 直连、下单链路、方法论）
 - [docs/RPC_API_REFERENCE.md](docs/RPC_API_REFERENCE.md) — **全部 RPC 方法参考**（参数、返回值、别名、大 QMT 能力边界）
 - [docs/FORMULA_SERVER_FASTPATH.md](docs/FORMULA_SERVER_FASTPATH.md) — FormulaServer(58600) 直连快速路径：协议、映射表、能力边界与回退行为
 - [docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md](docs/SUBSCRIBE_WHOLE_QUOTE_PUSH.md) — 全推行情订阅推送机制设计

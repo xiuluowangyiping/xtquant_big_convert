@@ -321,8 +321,12 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(trades[0].order_type, STOCK_BUY)
         self.assertEqual(trades[0].traded_price, 10.0)
         self.assertEqual(trades[0].order_remark, "remark-1")
-        self.assertEqual(order_id, "sys-2")
-        self.assertTrue(cancelled)
+        # MiniQMT hands back an int 委托编号; Big QMT only has the broker's
+        # string 合同编号, so the id is both (issue #113).
+        self.assertEqual(str(order_id), "sys-2")
+        self.assertIsInstance(order_id, int)
+        self.assertGreater(order_id, 0)
+        self.assertEqual(cancelled, 0)      # 0 == success, not True
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
         # strategy_name 默认 ""（返回全部委托），与服务端一致（strategy_name 陷阱）。
         self.assertEqual(trader.client.calls[-4][1]["strategy_name"], "")
@@ -764,6 +768,39 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(transport.name, "zmq")
         self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
         self.assertIsNone(transport.discovery_redis_client)
+
+    def test_pure_zmq_quote_metadata_does_not_build_redis_client(self):
+        """纯 ZMQ 的兼容订阅元数据不能隐式连接 Redis。"""
+        client = BigQmtRpcClient(account_id="acct", redis_config={"transport": "zmq"})
+        client._redis = lambda: (_ for _ in ()).throw(AssertionError("Redis must not be used"))
+
+        event = client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(event["event_type"], "subscribe_quote")
+
+    def test_mysql_quote_metadata_keeps_existing_redis_path(self):
+        """非 ZMQ transport 继续使用既有 Redis 订阅元数据。"""
+        class RedisRecorder:
+            def __init__(self):
+                self.calls = []
+
+            def xadd(self, *args, **kwargs):
+                self.calls.append("xadd")
+
+            def publish(self, *args, **kwargs):
+                self.calls.append("publish")
+
+            def hset(self, *args, **kwargs):
+                self.calls.append("hset")
+
+        redis = RedisRecorder()
+        client = BigQmtRpcClient(account_id="acct", redis_client=redis, redis_config={"transport": "mysql"})
+
+        client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(redis.calls, ["xadd", "publish", "hset"])
 
 
 if __name__ == "__main__":
