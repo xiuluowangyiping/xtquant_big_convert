@@ -4,6 +4,14 @@
 
 ## [Unreleased]
 
+### 修复
+
+- **subscribe_quote 盘中推送旧快照**（Issue #104）：订阅轮询默认走 FormulaServer 直连，其快照可能滞后数小时（实盘实测 11:30 后冻结、收盘后仍停在午间数据），导致"刚完成的 bar"被推成数小时前的旧值。订阅轮询改走 RPC 桥读 QMT 实时数据（`use_formula=False`，client.call / get_market_data_ex 新增该开关，默认行为不变）。实盘验证：最新 bar 为 15:00 收盘 bar 而非 11:30 旧快照。
+- **FormulaServer 快照滞后检测 + 自动回落**：intraday（tick/1m/5m/15m/30m/1h）直连回答的最新 bar 滞后超过 30 分钟（或跨日）时，本次调用**自动回落 RPC 桥拿实时数据**（不是只告警），并进入 120s 冷却期——冷却内 get_market_data_ex 直接跳过直连（不付双倍成本），到期自动重新探测（自愈）。告警同 code+period 每日一次。实盘验证：滞后检出 → 回落拿到 15:00 收盘 bar；冷却期跳过；到期恢复直连。
+- **probe_capabilities RPC**（此前已提交）：能力探测接口 + 部署快速开始文档 + 延迟报告 + launcher 锁屏防护。
+
+## [Unreleased]
+
 ### 新增
 
 - **能力探测 RPC `probe_capabilities`**：只读探查当前部署暴露了哪些 QMT callable——运行时全局函数绑定（passorder/download/信用等 20 项）、ContextInfo 方法存在性、信用接口只读试调（行数/报错）。部署后跑一次即可确认这台券商 QMT 的能力边界。参考 cfquant 的 credit probe 思路。
@@ -13,6 +21,280 @@
 ### 修复
 
 - **qmt_launcher 锁屏防护**：`restart_qmt` 在会话锁屏且需要自动登录时直接拒绝执行（否则关掉终端却登不回去，交易中断）；新增 `session_is_locked()` 检测。
+
+## [0.3.7] - 2026-08-31
+
+### 新增
+
+- **卡顿监控：区分「桥卡住」和「桥死了」**：`zmq slow handler` 是在 handler **返回之后**计时的，所以一个阻塞住的调用在结束之前什么都不打印。实测遇到过一次 346 秒的阻塞，那期间日志只有 adjust 心跳、每 10 秒 100 拍，**看上去一切健康**——而从客户端看，卡住和死掉是同一件事：超时。
+
+  现在有 watchdog 线程在 handler **还在跑的时候**就报：
+
+  ```
+  [bigqmt_rpc] zmq handler STILL RUNNING method=get_full_tick 6s
+  thread=bigqmt-zmq-rpc queued=0 -- the bridge is blocked, not dead
+  ```
+
+  默认 20 秒触发——比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**。指数退避，一次长阻塞不会把它自己要解释的日志淹掉。`BIGQMT_REDIS_CONFIG["zmq"]["stall_warn_seconds"] = 0` 关闭。
+
+- **启动预热**：重启后第一次 `get_financial_data` 可能要几分钟（实测 346 秒）。启动后会在**后台守护线程**上先跑一次，把这份等待提前付掉，并留下日志。
+
+  **特意不放主线程**：启动诊断跑在 `init()` 里，把一个可能几百秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住启动——比原问题更糟。`BIGQMT_REDIS_CONFIG["warm_context_data"] = False` 关闭。
+
+  预热**会自检取到多少行**，取不到直说：
+
+  ```
+  [bigqmt_warmup] get_financial_data warm in 0.41s (159 rows)
+  [bigqmt_warmup] get_financial_data returned NOTHING in 0.02s -- the probe
+  did not exercise the path it is meant to warm
+  ```
+
+  这个自检是实盘验证时挣来的：第一版预热用了**空的日期区间**，被 QMT 接受、瞬间返回 `None`，日志却报 `warm in 0.00s` 的成功。一个静默空转的预热比不做更糟。
+
+### 实盘验证
+
+四次策略重启，逐项验证：
+
+- ✅ **watchdog**：临时把阈值调到 5 秒，跑一个 15.94 秒的请求，日志在 6s 和 11s 各报一次（退避生效），方法名/线程/队列深度均正确，**报的时候调用还在跑**。
+- ✅ **预热**：`warm in 0.00s (242 rows)`，确认真取到数。
+- ❌ **预热能否挡住那 346 秒：未证明**。见下。
+
+### 已知限制
+
+- **预热对 346 秒的实际效果尚未证明。** 当天策略重启四次，346 秒只在第一次出现；预热现在报 0.00s，说明该调用本来就是热的——**它预热的是一个已经热的东西**。那份代价更可能在 QMT **终端**进程里，而终端当天没有重启。要验证只能等终端重启后的第一次。机制可用、自检可靠，效果待实证。
+- **346 秒的根因仍未查清**：为什么一个 `ContextInfo` 调用会在后台 listener 线程上阻塞数百秒，而 QMT 自身健康、主策略线程空闲。已排除：按代码的冷缓存、按表的冷缓存、我们自己的字段翻译、以及「QMT 行情订阅重建慢」（曾据此解释，后被推翻——所依据的日志空档当天还有多处，完全正常）。watchdog 是下次复现时的眼睛。
+- 其余同 0.3.6。
+
+---
+
+## [0.3.6] - 2026-08-31
+
+### 修复
+
+- **可转债的最小申报量、市场推断与报价精度**（PR #121）：三处同一个原因——代码里没有「债券」这个概念，一律按股票处理。
+
+  | 位置 | 修复前 | 后果 |
+  |---|---|---|
+  | `code_utils.min_lot()` | 可转债返回 100 | `round_buy_volume` 把一手转债算成 `(10 // 100) * 100 == 0`，**单子直接废掉** |
+  | `code_utils.normalize_stock_code()` | 裸 6 位码按「5/6 开头 = 沪市」 | 沪市转债 110/111/113/118/132 都是 `1` 开头，**被判到深市**，拿去下单是另一只票 |
+  | `price_engine._price_precision()` | 只把 15/16/51/52 当 3 位小数 | 转债报价精度同样是 0.001，按 2 位取整会被交易所拒单 |
+
+  是在给 [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard) 接可转债交易时踩出来的。
+
+- **直连路径对四个字段静默返回 NaN**（Issue #104）：FormulaServer 直连**接受任何字段名**，对它没有的四个字段不报错，而是返回一整列 `NaN`。实盘量的：
+
+  ```
+  field_list=[...11 个字段名...]   0.015s   preClose=nan   suspendFlag=nan
+  field_list=[]                    (RPC)    preClose=9.0   suspendFlag=0
+  ```
+
+  同样的列、同样的形状、快 12 倍、数据静默错了。而这正是有人在被告知「写明字段名能走快路径」之后会做的事——客户端自己还打印了这条提示。
+
+  `settelementPrice` / `openInterest` / `preClose` / `suspendFlag` 是**日频元数据**，不是 K 线数据，所以直连缺的正好是这四个。
+
+  现在沿用 `dividend_type` 与 `period=tick` 已有的规矩：**这条路径答不诚实的请求，交给 RPC**。用白名单（`open/high/low/close/volume/amount/time/stime`）而不是黑名单——不认识的字段名走 RPC 只是慢，猜它「大概能供」则可能静默出错，而这个 bug 正是这么来的。
+
+- **文件损坏时抛裸 `NameError`**（Issue #102，@huliangyu）：他的策略文件第一行是一串 200 字符的 token，不是代码。Python 把它当变量名求值，报出：
+
+  ```
+  File "...\bigqmt_signal_trader_strategy.py", line 1, in <module>
+      MiFBOecYoHXT4UUBBOIr3m5aTVbA5Rbt6OnG52cfBT5EAtPG9kA7kQnEsKu...
+  NameError: name 'MiFBOecYoHXT4UUB...' is not defined
+  ```
+
+  这条报错**看不出文件坏了**，所以第一反应的答复是「可能是版本问题，重新部署」——而那对这个文件无效，**换任何版本都一样报错**。
+
+  加载器现在在 exec 失败时看一眼第一行像不像 Python，像 token 就直说，并明确指出「换版本没用」。判定**故意做窄**：40 字符以上、无空白、字符全在 base64 字母表内——满足这三条的 Python 行只可能是裸标识符，本来就是坏代码。
+
+  两个入口脚本（`BIGQMT_REDIS_DRYRUN.py` / `BIGQMT_ZMQ_BACKTEST.py`）各内联一份；它们是引导包的入口，不能反过来 import 包里的工具。
+
+### 已实盘验证（本版全部改动）
+
+- ✅ **字段守卫**：六列快路径 0.016s 不变；六列 + `preClose` 回落 RPC 返回**真值 9.0**（原为 `nan`）；显式写全 11 列返回四列真值（`preClose=9.0` / `suspendFlag=0` / `openInterest=13`），与 `field_list=[]` 对照一致。1m / 5m / 1d 三周期行为一致，陌生字段名（`turnoverRate` 等）实盘确认回落 RPC。
+- ✅ **损坏文件报错**：端到端跑真实加载器——正常模块照常加载，`undefined_name_here` 仍抛它自己的 `NameError`（守卫够窄），token 文件给出新消息。**并在部署到 QMT 目录后，用 QMT 里那份实际执行的入口脚本复验通过。**
+
+### 说明
+
+- **如果你把入口脚本改过名**（例如 `BIGQMT_REDIS_DRYRUN.py` → `BIGQMT_REDIS.py`），`sync_deployment()` **不会更新它**——它只刷新部署目录里已存在的同名文件。改过名的入口需要手动重新拷一份。
+
+### 已知限制
+
+同 0.3.5：回测「启动 → 停止 → 再启动」、信用委托 27/28/40 到达券商的品种、撤单返回值、订单号双形态、长列表恢复的失败路径、期货行情，均待实盘验证。
+
+---
+
+## [0.3.5] - 2026-08-31
+
+### 修复
+
+- **长代码列表恢复失败时抛出无意义的错误**（Issue #104，@frank0532 在 0.3.4 上报告）：
+
+  ```
+  File ".../xtquant_compat.py", line 1163, in get_full_tick
+      raise
+  RuntimeError: No active exception to reraise
+  ```
+
+  这是 0.3.1 引入恢复逻辑时留下的 bug。那个 `raise` 在 `except` 块**外面**——except 已经退出，没有活跃异常可重新抛出，于是**真正发生的超时被换成了一条毫无意义的错误**。
+
+  而且重读那边把自己的失败原因也吞了（`except Exception: return None`），所以即便修好 `raise`，仍然没有任何地方知道恢复为什么没成功。
+
+  现在：原始异常按**原类型**重新抛出（写 `except TimeoutError` 的调用方照旧接得住），重读失败的原因写进 warning 日志。
+
+  > 这让报错变得有用，**并不保证超长列表一定能成功**。要全量数据，市场令牌始终更快：`get_full_tick(["SH"], types=["all"])`，7.7s 一次请求。
+
+### 已实盘验证（本次新增）
+
+- ✅ **`subscribe_quote` 的分周期 K 线订阅**（@frank0532 在 #104 问及）：盘中实测 `period="1m"`，210 秒内 4 次回调，bar 时间戳精确间隔 60 秒；`1m` / `5m` / `1d` 均返回 `{code: DataFrame}`，列为 `time/open/high/low/close/volume/amount`。该能力自 0.3.0 起即已具备，此前从未实盘确认过。
+
+### 已知限制
+
+- **`passorder` 被调用但委托不出现**：若桥的策略运行在 QMT 的**编辑器**界面，`passorder` 会静默什么都不做（QMT 文档 1.2：「编辑器里执行的下单函数不会产生实际委托」；回测/模拟信号模式同理）。这不是桥的缺陷，但表现为 `passorder submitted but order not found in system`。请确认策略在**模型交易**界面运行。
+- 其余同 0.3.4：回测「启动 → 停止 → 再启动」、信用委托 27/28/40 到达券商的品种、撤单返回值、订单号双形态、期货行情，均待实盘验证。
+
+---
+
+## [0.3.4] - 2026-08-30
+
+### 修复
+
+- **回测：三个报告，两个原因**（Issue #109，@wolfeee）
+
+  **弃用提示和 `不支持'prev_close'数据字段` 是同一个 bug。** `ContextInfo.get_history_data` 只提供 `open` / `high` / `low` / `close` / `quoter` 五个字段（API 参考 5.2），且标着【不推荐】。而 bar 提取器把它想要的**每个**字段都拿去问它——`prev_close`、`preClose`、`lastClose`、`volume`、`amount`。这些问必然失败，而且**每问一次 QMT 就往自己的日志里写一行 ERROR**，每字段 × 每周期 × 每根 K 线。
+
+  更没道理的是：提取器本来就用上一根 K 线的收盘价填 `prev_close`，所以这些问从头到尾没有可能有收益。现在先用主推接口 `get_market_data_ex`，`get_history_data` 只问它真正有的字段。
+
+  **停止后重启 bind 失败是真的端口泄漏。** `stop()` 只告诉引擎回测结束，从没停过 ZMQ 服务——端口继续被一个已经不存在的策略占着（回测界面的停止按钮走的正是这条路径）。而且 `stop_server()` 只设标志就返回，服务线程最多 `poll_ms` 之后才关 socket，`init()` 紧接着就 bind 下一个。端点是固定端口，没有退到随机端口的余地，这个竞态的结果只能是 EADDRINUSE。
+
+  现在 `stop()` 会停服务，`stop_server()` 会等 socket 真的关闭。bind 失败也会保留原因——光一句 `failed to bind` 会让人往错方向查，带上 `Address in use` 才知道有一个跑着的回测要先停。
+
+- **客户端默认 RPC 超时从 6s 提到 30s**：验证 0.3.3 部署时发现 `get_financial_data` 对着一个健康的桥超时了。同一个桥上实测：`query_orders` 1.5s、`get_asset` 1.4s、`get_financial_data` 0.8s（热）、整市场 `get_full_tick` 7.7s。
+
+  **超时比等待更糟**：请求已经到桥那边，桥会继续做完，只是客户端不听了。下一个调用就排在一份没人要的工作后面——**一次超时繁殖出更多超时**（实测中三个调用连续各超过 45s，正是桥在消化上一轮被 6s 掐掉的请求）。不会串号：transport 按 `request_id` 匹配响应，迟到的被丢弃。
+
+  选 30s 是因为整市场快照那条路径本来就用 30s，现在是一个数而不是两个。`timeout_seconds=` 参数与 `BIGQMT_RPC_TIMEOUT_SECONDS` 环境变量照旧优先。
+
+  **两个配置模板也带着 `6.0`** —— example，以及 `bigqmt-init` 给每个新用户生成的那份。只改默认值的话，跑过 init 的人都拿不到这个修复。三处由测试一起钉住。
+
+  顺带更正 `get_full_tick` 文档字符串里「client default 120s」的错误说法。
+
+### 已实盘验证（0.3.3 部署，本次确认）
+
+- ✅ **多股多日期财务数据**（Issue #115）：双股 + 日期区间返回 `{'000017.SZ': DataFrame(159 行), '000001.SZ': DataFrame(159 行)}`，0.16s。修复前这里是 `{'is_copy': None}`。
+- ✅ **未知 order_type 的新报错**（Issue #92）：`9999` 得到指名版本的新消息；`27` **被接受**（卡在后面的 `stock_code is required`），证明信用类型在部署端已生效；无参数时保持原消息；`32` 报「无隐含买卖方向」。
+- ✅ **`types=` 收窄**（Issue #104）：`['stock']` 1.13s / 2315 只，`['all']` 7.74s / 26744 只，默认 0.85s / 2315 只。
+
+### 已知限制
+
+- **回测修复未实盘验证**：跑在 QMT 回测进程里，需要走一遍「启动 → 停止 → 再启动」。
+- **信用委托 27 / 28 / 40 到达券商的品种未验证**：RPC 层已确认接受，但是否真的作为融资买入送达券商仍需信用账户实单。
+- **撤单返回值未实盘验证**：需要一笔真实可撤委托。
+- **订单号形态未在实盘记录上验证**：验证当日账户无委托无成交。
+- **期货行情**：本机无期货权限。
+
+---
+
+## [0.3.3] - 2026-08-30
+
+### 修复
+
+- **未知 `order_type` 的报错误导性极强**（Issue #92）：传 `order_type=27` 得到的回应是 `action or order_type is required`——可调用方明明传了。报告人因此两次回来贴同一份 traceback，间隔半小时，一字不差；两次都在检查自己的调用。
+
+  真正的原因报错里一个字都没提：**QMT 目录里部署的那份包早于信用委托类型**。这段代码跑在 QMT 里，客户端 `pip install --upgrade` 碰不到它。
+
+  根因是那个检查**没有区分**「没传 order_type」和「传了但不认识」，两种情况共用同一条消息。现在分开：
+
+  - 没传 → 保持原消息 `action or order_type is required`
+  - 传了但不认识 → 说清楚是**哪个值**、**哪个版本**拒绝的、以及**升级客户端没用**
+
+  ```
+  order_type 9999 is not recognised by the package deployed in QMT (0.3.3).
+  Credit order types (27-32, and 40-45 special) need 0.3.1 or newer HERE, in
+  the QMT python directory -- upgrading the client with pip does not change
+  this file. Run xt_trader.sync_deployment(), restart the strategy, then check
+  xtdata.get_deployment_info().
+  ```
+
+  消息是**纯 ASCII** 的：QMT 的日志写入会丢非 ASCII 字符（本项目遇到过中文安装路径被吞成乱码），一条乱码的报错帮不上任何人。这一点由测试钉住。
+
+### 已知限制
+
+- 同 0.3.2。**信用委托类型（27/28/40）仍未实盘验证**——@fengzhizialex 已确认信用账户的资产与持仓正常（Issue #92），下单类型待其完成部署后验证。
+
+---
+
+## [0.3.2] - 2026-08-30
+
+### ⚠️ 破坏性变更：`cancel_order_stock` 的返回值
+
+**撤单以前返回 `True` / `False`，现在返回 `0`（成功）/ `-1`（失败），与 MiniQMT 一致。**
+
+```python
+# 需要改
+if xt_trader.cancel_order_stock(acc, order_id):      # ✗
+# 改成
+if xt_trader.cancel_order_stock(acc, order_id) == 0: # ✓
+```
+
+这是有意向 MiniQMT 契约靠拢。原来的 bool **把判断反过来了**：MiniQMT 的写法是 `== 0`，而 Python 里 `False == 0` 为 True，所以撤单**失败**被读成成功，**成功**被读成失败。而我们自己的异步回调早就在用 `cancel_result=0` 表示成功，同一套 API 的两半互相矛盾。
+
+### 修复
+
+- **返回类型与 MiniQMT 不符**（Issue #113，@tokens-lin）：报的是 `order_stock` 返回字符串而不是数字。顺着查了整个接口面，同类问题三处：
+
+  | 接口 | MiniQMT | 修复前 |
+  |---|---|---|
+  | `order_stock()` | `int`（失败 -1） | `str` 合同编号 |
+  | `cancel_order_stock()` | `int`（0 成功） | `bool` |
+  | `XtOrder.order_id` / `XtTrade.order_id` | `int` | `str` |
+
+  另有一个边角：委托被拒时服务端返回的是**字符串** `"-1"`，它 truthy 且永不等于 `-1`，所以废单也被读成成功。
+
+  大 QMT 没有 int 委托编号可给——`get_trade_detail_data` 只有 `m_strOrderSysID` 字符串。所以订单号做成 int 子类，两种形态同时成立：
+
+  ```python
+  order_id = xt_trader.order_stock(acc, "600000.SH", 23, 100, 11, 10.0, "s", "")
+
+  isinstance(order_id, int)   # True，MiniQMT 写法照常
+  order_id > 0                # True
+  str(order_id)               # '合同编号'，券商原始串
+  xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回原始串
+  ```
+
+  纯数字编号（多数券商）int 值就是那个数字；非数字的给一个稳定正数替身，撤单仍用真实串。存进数据库变成普通 int 也能撤单——客户端记最近 4096 个映射。想要字符串用 `.order_sysid`，它一直是 str。
+
+  同样规则用于回调对象 `XtOrderError` / `XtCancelError` / `XtOrderResponse` 的 `order_id`。
+
+  原有 4 个测试文件里 **9 处断言把旧的字符串/布尔契约写死了**，测试与代码基于同一个错误前提，所以一直全绿。这些断言已改正。
+
+- **多股多日期财务数据只返回 `{'is_copy': None}`**（Issue #115，@jerry87n 精确定位）：QMT 的 pandas 0.22 下，`get_financial_data` 多股 **且** 多日期时返回的是 Panel。Panel 既没有 `.columns` 也没有 `.index`，一路穿过序列化层的 DataFrame 分支和 Series 分支，落到 `__dict__` 兜底——而 `vars(panel)` 是 `{'_data': ..., 'is_copy': None}`，下划线过滤后正好剩那一个。
+
+  不报错，没数据。单股或单日期返回 DataFrame，走得通，所以藏得久。
+
+  pandas 1.0 已删除 Panel，客户端重建不出来，因此现在返回客户端能用的形态：`{股票代码: DataFrame}`，轴标签一并带回。
+
+### 文档
+
+- **README 新增「与 MiniQMT 的兼容性对照」**（Issue #113 的原始诉求）：返回值对照表、int/str 双形态订单号、以及会咬人的行为差异（`types=` 默认值、`account_type` 不会从客户端传到服务端、xtconstant 与 passorder 两套编号）。
+
+- **更正 `qmt_launcher` 一段错误描述**：README 原先称 `login` 模式用 `win32api.SendMessage`、锁屏下也能工作。代码从 #45 起就相反——用 `keybd_event` 物理输入，要求对话框在前台，`session_is_locked()` 为真时直接抛异常拒绝。要**无人值守定时重启**请用 `linkmini` / `bat` / `exe`，只有 `login` 受此限制（Issue #116）。
+
+### 已知限制
+
+- **撤单返回值未实盘验证**：需要一笔真实可撤委托，本机没有。类型层面单测覆盖完整。
+- **Panel 修复未实盘验证**：改动跑在 QMT 内，需部署 + 重启策略后用一次多股多日期真实调用确认。
+- **信用委托仍未实盘验证**（0.3.1 起）：@fengzhizialex 已确认信用账户的**资产与持仓**正常（Issue #92），但 `order_type=27/28/40` 到达券商时是否为对应品种仍待验证。
+- 其余同 0.3.1。
+
+### 部署提醒
+
+Panel 修复在**服务端**（`redis_rpc.py` 跑在 QMT 里），只 `pip install --upgrade` 不生效——要把包拷进 QMT 的 python 目录并**重启策略**：
+
+```python
+xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
+```
+
+---
 
 ## [0.3.1] - 2026-08-30
 

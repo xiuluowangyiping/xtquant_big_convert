@@ -12,6 +12,8 @@
 
 另附 [qmt-trader skill](qmt-trader/)：让 Claude Code / ZCode / Cursor 等 AI 助手通过统一 CLI（46 个子命令）直接查行情、查持仓、下单撤单，详见下文「AI 助手 Skill：qmt-trader」。
 
+想看跑在这座桥上的完整应用长什么样，见 [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard)——一个多账号持仓监控与下单面板，详见下文「基于本项目的应用」。
+
 ---
 
 ### 配置向导：`bigqmt-init`
@@ -295,6 +297,68 @@ field_list=[open,high,low,close,volume,amount]
 
 **只要 OHLCV 就显式写出来**，那 30 倍就到手了。首次不传 `field_list` 时会在 `bigqmt.log` 记一条说明。
 
+### 启动预热与卡顿监控
+
+**重启策略后，第一次调用 `get_financial_data` 可能要几分钟。** 实测过一次 **346 秒**——当时 QMT 自身完全健康（全推行情每几秒一批、线程池正常），主策略线程也空闲（adjust 每 10 秒 100 拍，每拍 < 2ms）。当天之后的所有调用都在 1 秒内，**包括从没查过的票和没查过的表**，所以这是一次性代价，不是按代码的缓存未命中。
+
+问题在于它的传染性：**RPC 处理是串行的**，一个调用卡住，后面排队的全部超时。客户端看到的是一片超时，和「桥死了」完全一样。
+
+#### 启动时自动预热（默认开启）
+
+启动后会在**后台线程**上先跑一次这个调用，把这份等待提前付掉：
+
+```
+[bigqmt_warmup] get_financial_data: first call after a restart can take
+minutes; running it now so a caller does not have to wait
+[bigqmt_warmup] get_financial_data warm after 346.0s -- that wait is now paid
+```
+
+热了之后就是这样：
+
+```
+[bigqmt_warmup] get_financial_data warm in 0.31s
+```
+
+**预热不会让这个代价变便宜**，它只是把代价挪到一个确定的时刻、一个没人等待的线程上，并且留下一行说明——而不是让它以「第一个调用方莫名卡死」的形式出现。
+
+> **为什么不放在 init 里？** 启动诊断（`_diag_startup`）跑在主线程的 `init()` 中。把一个可能 346 秒的调用加进去，会在 adjust 定时器都还没排上的时候冻住整个启动——比原问题更糟。所以预热走独立守护线程，`init()` 立即返回。
+
+关掉它（服务端 local config）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "warm_context_data": False,
+}
+```
+
+#### 卡顿监控：区分「桥卡住」和「桥死了」
+
+handler 还在跑的时候就会报，不用等它结束：
+
+```
+[bigqmt_rpc] zmq handler STILL RUNNING method=get_financial_data 40s
+thread=bigqmt-zmq-rpc queued=3 -- the bridge is blocked, not dead
+```
+
+- 默认 **20 秒**触发。比实测最慢的健康调用（整市场快照 7.7s）长得多，又短于客户端 30 秒的默认超时，**所以日志会在调用方放弃之前就点名**
+- 指数退避，一次长阻塞不会把它自己要解释的日志淹掉
+- 调整或关闭（注意它在 **`zmq` 子块**里，不是顶层）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    # ...
+    "zmq": {
+        "stall_warn_seconds": 45,   # 0 = 关闭
+    },
+}
+```
+
+**看到成片超时时，先在服务端日志里搜 `STILL RUNNING` 或 `slow handler`。** 有这两行之一，就说明桥没死，只是被一个慢调用堵住了——等它跑完，或者查那个方法。
+
+> 注意 `slow handler` 是**事后**打的（handler 返回才计时），`STILL RUNNING` 才是进行中的。
+
+
 ### 版本检测与部署同步
 
 部署到 QMT 是**文件拷贝**，而 QMT 跨策略重跑保留 `sys.modules`。所以「忘了拷」和「拷了但没被加载」从外部看**一模一样**——这是本项目最容易浪费时间的一类问题：本地修好了，实盘却像没修。
@@ -426,10 +490,15 @@ python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交
 | `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
 | `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
 
-**关于「pywinauto/pyautogui 要求 Windows 处于登录状态」**：`login` 模式用的是
-`win32api.SendMessage` 直接投递到窗口句柄，不是 pyautogui 那种按屏幕坐标重放物理输入。
-前者不要求窗口置于前台，锁屏下也能工作（会话还在即可，完全注销则不行）。密码从
-环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
+**`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
+物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
+当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
+先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
+
+> 需要**无人值守定时重启**的话，用 `linkmini` / `bat` / `exe` 三种模式，它们不碰登录框，
+> 锁屏也能跑。只有 `login` 受这条限制。
+
+密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
 对同机任何进程可见。
 
 两个设计要点：
@@ -1256,6 +1325,33 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 
 ---
 
+## 基于本项目的应用：bigqmt-dashboard
+
+[**bigqmt-dashboard**](https://github.com/litaolemo/bigqmt_dashboard) —— 大QMT 直连的多账号持仓监控与下单面板。浏览器里看持仓、资金曲线、买卖流水，点一下就把单子报进大QMT。
+
+[![面板总览](https://raw.githubusercontent.com/litaolemo/bigqmt_dashboard/main/docs/screenshots/01-overview.png)](https://github.com/litaolemo/bigqmt_dashboard)
+
+它是本项目目前最完整的下游使用者，几乎把这里的接口都跑了一遍——如果你想知道某个 API 在真实业务里怎么用，那边有现成的代码：
+
+| 它用了什么 | 对应到本项目 |
+|---|---|
+| 每账号独立连接、可连不同机器上的大QMT | 直接构造 `BigQmtXtTrader(account_id=..., redis_config=...)`，**不用** `configure()` 的模块级单例 |
+| 账户数据同步 | `query_stock_positions` / `query_stock_asset` / `query_execution_snapshot` |
+| 实时委托与成交回报 | `register_callback` + `start()`，回报经 `exec_events` 推来 |
+| 下单撤单 | `order_stock_result` / `cancel_order_stock`（需 `rpc_allow_order_methods=True`） |
+| 实时行情与分钟线 | `get_full_tick` / `get_market_data_ex`（缺数据时先 `download_history_data2` 再重试） |
+| 合约属性 | `get_instrument_detail` / `get_instrument_type`，走 FormulaServer 直连快速路径 |
+| 打新债 | `ipo_subscribe_all(stock_type="BOND")` |
+| 换传输不改代码 | 账号配置里的 `rpc` 段整包透传给 `BigQmtRpcClient`，`transport` 改 `redis`/`zmq` 即可 |
+
+几个从对接中反馈回来、值得单独提一句的点：
+
+- **可转债的下单规整要自己写。** `code_utils.min_lot()` 只认「688 开头 = 200，其余 = 100」，可转债最小 10 张会被 `(10 // 100) * 100` 规整成 **0**；`normalize_stock_code()` 对裸 6 位码按「5/6 开头 = 沪市」判断，沪市转债 `110xxx` 会被判到深市。面板那边重写了一份全品种规则（含科创板 200 股起按 1 股递增、ETF/转债 0.001 报价精度），并拿 `get_instrument_detail` 返回的 `PriceTick` 交叉验证过 9 个品种，全部吻合。
+- **`get_market_data_ex` 读的是 QMT 本地库。** 没 `download_history_data2` 过的标的返回 0 根而不是报错——面板实测 10 只持仓全都没有 1m 数据，走势图整列是空的，加了「缺数据先下载再重试」才好。
+- **`docs/XTQUANT_COMPAT_REPLACEMENT.md` 里「RPC 暂不推送回调」是旧文。** 代码里 `BigQmtXtTrader.start()` 会拉起执行事件监听线程，`on_stock_order` / `on_stock_trade` 是真的会触发的。
+
+---
+
 ## 相关文档
 
 - [CHANGELOG.md](CHANGELOG.md) — **版本变更记录**（新增/修复/变更）
@@ -1270,7 +1366,8 @@ python qmt-trader/scripts/qmt.py buy 600000.SH 100 --price 7.50 --dry-run
 - [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md) — 用兼容层替换旧 xtquant 的步骤
 - [docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md](docs/BIG_QMT_SIGNAL_TRADER_RUNBOOK.md) — 信号交易运行手册
 - [docs/ZMQ_BACKTEST_BRIDGE.md](docs/ZMQ_BACKTEST_BRIDGE.md) — 独立 ZMQ 回测协议、撮合规则和 QMT 入口
-- [qmt-trader/](qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（46 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」专节
+- [qmt-trader/](qmt-trader/) — **QMT Trader skill**：AI 助手统一 CLI 驱动全部 QMT API（46 子命令 + 通用 rpc 兜底），用法见上文「AI 助手 Skill：qmt-trader」
+- [bigqmt-dashboard](https://github.com/litaolemo/bigqmt_dashboard) — **基于本项目的持仓监控与下单面板**：多账号、服务端风控闸门、完整可转债支持，可当作接口的实际用法参考专节
 
 ---
 
