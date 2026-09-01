@@ -89,7 +89,15 @@ python -m bigqmt_signal_trader.init_config
 
 - `bigqmt_signal_trader.xtquant_compat`：把旧代码的 `xt_trader` / `xtdata` 调用转成 RPC，无需改业务代码。
 - 兼容 MiniQMT 方法名：`query_stock_asset` / `query_stock_positions` / `query_stock_orders` / `get_full_tick` / `order_stock` 等。
-- 顶层 `xtquant.xtdata.get_stock_type(stock)` 显式转发到 RPC；完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
+- **委托/成交对象补齐 MiniQMT 契约**（0.3.8 起，issue #133）：`query_stock_orders` / `query_stock_trades` 返回的对象新增 `account_type`（xtconstant 数字码，取部署实际配置的类型而非硬编码 2）、`instrument_name`、`secu_account`、`offset_flag`、`direction`，成交多一个 `commission`。
+
+  **`strategy_name` 只对经本桥下的委托有效**：实测 QMT 的 ORDER（120 个属性）和 DEAL（47 个属性）行上**都没有 `m_strStrategyName` —— `get_trade_detail_data` 按策略过滤却从不回报。本桥下的单从自己的委托身份库回填（下单时按作为备注发出的 `user_order_id` 记录）；**手工在终端下的单没有备注，保持为空**。
+
+  `secu_account` 同理恒为空：两种行都不带股东代码。字段保留是为了读到 `""` 而不是 `AttributeError`。
+
+- **`describe_trade_detail_fields(account)` 诊断 RPC**（0.3.8 起）：返回 QMT 自己的 ORDER / DEAL 行上**有哪些属性名**（只返回名字不返回值）。遇到"某字段为空"时，它回答的是"**是终端没给，还是桥没转发**"——这两种从客户端看完全一样。
+
+- **`get_stock_type` 在大 QMT 上不可用，会显式抛错**（0.3.8 起）：服务端走 `ContextInfo.get_stock_type`，而这个 stub 对**任何**代码都返回 `0` —— 实测股票 / ETF / 债券 / 期权、以及各种代码格式全是 0。恒为 0 的"类型"比报错更糟（报错看得见，错的分类看不见），所以改成抛 `NotImplementedError` 并指向真正能用的 `get_instrument_type(code)`，后者实测能区分 `stock` / `fund` / `etf` / `bond` / `index`。完整 QMT 的交易日 ContextInfo fallback 会把 `SH/SZ` 转成代表指数代码。委托快照增量暴露 `price_type` / `traded_price`，旧 QMT 不提供时分别保持 `None` / `0.0`。
 - **完整 xtconstant 枚举**（539 个常量，涵盖原生 MiniQMT 全部 90 个，值逐一比对无改动）：账号类型、委托类型（股票/期货/信用/期权）、报价类型、委托状态、账号状态、`ORDER_TYPE_SET`。
 
 ```python
@@ -408,7 +416,27 @@ xt_trader.sync_deployment()               # 真同步
 | **覆盖前备份** | 每个被覆盖的文件留 `.bak_<时间戳>` |
 | **原子写入** | 先写临时文件再替换，中断不会留下半个模块 |
 
-> **同步之后仍然必须手动重启策略。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+> **同步之后必须让策略重新加载。** QMT 跨重跑保留 `sys.modules`，拷贝本身不生效——每次同步结果都带 `restart_required` 并在日志里提示。
+
+#### 让同步生效：`reload_deployment()`（0.3.8 起，不用重启）
+
+```python
+xt_trader.reload_deployment("why")   # -> {'scheduled': True, 'version_before': '0.3.7'}
+xt_trader.reload_status()            # -> {'ok': True, 'modules_purged': 28,
+                                     #     'version_before': '0.3.7',
+                                     #     'version_after': '0.3.8', 'seconds': 0.79}
+```
+
+把所有 `bigqmt_signal_trader.*` 从 `sys.modules` 清掉、重新绑定策略模块 import 时持有的引用、再跑一次 `init()` 重建对象图。**约 0.8 秒。**
+
+**只是"已排期"**：执行它要 `reset_app()`，那会停掉正在应答这个请求的 RPC 服务，所以回复必须先发出去；真正的重载在下一个 adjust tick 上做，轮询 `reload_status()` 看结果。期间约 1 秒的查询会超时（服务正在重建）。
+
+| | |
+|---|---|
+| **能刷新** | `bigqmt_signal_trader/` 下的一切——适配器、RPC handler、models、传输层 |
+| **刷新不了** | `bigqmt_signal_trader_strategy.py` 和 `BIGQMT_REDIS_DRYRUN.py`。QMT 自己 exec 这两个文件，**模块没法 reload 自己所在的模块**——改这两个仍要重启策略 |
+
+用 purge 而不是 `importlib.reload`：reload 必须按依赖顺序（`order_bigqmt` 在 import 时 `from ..models import OrderSnapshot`，顺序错了会**静默**留住旧类），purge 没有顺序问题。
 
 **同步逻辑跑在客户端，不在 QMT 里。** 让交易进程盘中改写自己的代码，等于把源码树里的任何东西（包括改到一半的）直接送上实盘。
 
@@ -478,6 +506,10 @@ pymongo 的 `bson`，两者输出实测逐字节一致），客户端不需要�
 
 大 QMT 基本每天早上要重启一次，卡点在登录框。两条路绕过它：
 
+> **依赖**：进程枚举优先用 `psutil`；Win11 起系统不再带 `wmic`，没有 psutil 时
+> `close_qmt`/`status` 会直接报 `cannot enumerate processes`（issue #128）。
+> 装上即可：`pip install psutil`。
+
 ```bash
 python -m bigqmt_signal_trader.qmt_launcher status  --dir "D:\国金证券QMT交易端_lemo"
 python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交易端_lemo"
@@ -485,21 +517,64 @@ python -m bigqmt_signal_trader.qmt_launcher restart --dir "D:\国金证券QMT交
 
 | mode | 做什么 | 需要登录框交互 |
 |------|--------|---------------|
-| `linkmini`（默认优先）| `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
+| `linkmini` | `XtMiniQmt.exe linkMini`，MiniQMT 免密启动 | 否 |
 | `bat` | 跑指定批处理（如 `免密登录qmt.bat`）| 否 |
 | `exe` | 直接起 `XtItClient.exe`，靠终端自身恢复会话 | 否 |
-| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 |
+| `login` | 起 exe 后向登录框输入账号密码 | 是，需 pywin32 + pyautogui |
+
+> ⚠️ **`linkmini` 对本项目不可用**：它起的是迷你终端（MiniQMT），没有策略编辑器和
+> ContextInfo 运行时，桥作为大 QMT 策略跑不进去。本项目的桥必须用 `exe` / `bat` /
+> `login` 三种模式（都起大终端）。`linkmini` 只在你**同时需要迷你终端**（给外部
+> xtquant SDK 提供行情/交易服务）时才有意义——那是另一个进程，与桥互不影响。
 
 **`login` 模式需要未锁屏的交互式桌面。** 它用的是 `keybd_event` / `mouse_event`
 物理输入（经 ctypes），不是 `SendMessage`——消息式输入投不到 Qt 对话框的焦点控件上，
 当别的窗口在前台时会静默失败，什么也不输入。物理输入要求对话框在最前，所以启动前会
 先把它置顶并核验；锁屏或 RDP 注销的会话直接抛 `QmtLauncherError` 而不是打一半密码。
 
-> 需要**无人值守定时重启**的话，用 `linkmini` / `bat` / `exe` 三种模式，它们不碰登录框，
-> 锁屏也能跑。只有 `login` 受这条限制。
+> 需要**无人值守定时重启**（重启的是**大终端**+桥策略）的话，用 `bat` / `exe` / `login`
+> 三种模式。`bat`/`exe` 不碰登录框、锁屏也能跑，但要求终端自身能恢复会话（设了自动登录）；
+> `login` 会替你输密码，但受锁屏限制。
 
 密码从环境变量 `BIGQMT_LOGIN_USER` / `BIGQMT_LOGIN_PASSWORD` 读，不走命令行参数——argv
 对同机任何进程可见。
+
+#### Python API
+
+除了命令行，也可以在代码/计划任务脚本里直接调函数（语义与 CLI 一致）：
+
+```python
+from bigqmt_signal_trader.qmt_launcher import (
+    close_qmt, open_qmt, restart_qmt,
+    is_qmt_running, find_qmt_processes, wait_until_ready, session_is_locked,
+)
+
+# 关：先礼貌 terminate（QMT 会冲刷本地数据），force_after_seconds 后才强杀。
+# 只终结该安装目录 bin.x64 下的进程；拿不到 exe 路径的进程直接跳过而不是误杀。
+close_qmt(r"D:\国金证券QMT交易端_lemo", force_after_seconds=20)
+
+# 开：mode 见上表（exe/bat/login；linkmini 对本项目不可用）。
+# login 模式自动填账号密码：Alt 解锁前台 + 置顶 + 字段级像素验证打字，
+# 打完逐段验证（账号必须进账号区、密码必须进密码区），错了清空中止，不提交错表单。
+open_qmt(
+    r"D:\国金证券QMT交易端_lemo",
+    mode="login",
+    credentials={"user": "你的账号", "password": "你的密码"},
+    window_title_prefix="QMT",          # 登录框标题包含串（模拟端 "国金QMT交易端模拟" 也能匹配）
+    ready_timeout_seconds=180,          # 等 FormulaServer(58600) 就绪的超时
+)
+
+# 一把重启：close_qmt → 等端口释放 → open_qmt。会话锁屏且需要 login 时直接抛错
+# （而不是关掉终端却登不回去）。
+restart_qmt(r"D:\国金证券QMT交易端_lemo", mode="login",
+            credentials={"user": "...", "password": "..."})
+
+# 状态查询
+is_qmt_running(r"D:\国金证券QMT交易端_lemo")      # 进程在不在
+find_qmt_processes(r"D:\国金证券QMT交易端_lemo")  # [(pid, 进程名, exe 路径)]
+wait_until_ready(port=58600)                       # 阻塞到 FormulaServer 可连接
+session_is_locked()                                # 交互式会话是否锁屏
+```
 
 两个设计要点：
 

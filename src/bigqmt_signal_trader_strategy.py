@@ -166,6 +166,206 @@ def bind_qmt_api(passorder_func=None, cancel_func=None, get_trade_detail_data_fu
                 _qmt_api[name] = func
 
 
+# A reload asked for over RPC. Deferred to the adjust tick rather than done in
+# the handler, because reset_app() stops the very RPC service that is answering
+# the request -- the reply has to be sent first.
+# not_before: the reply to reload_deployment has to reach the client before the
+# transport it would travel on is torn down. Longer than the ZMQ ROUTER's
+# 1s RCVTIMEO, because that is how long its thread can sit in recv_multipart
+# before it loops back to _drain_response_queue and actually sends the reply.
+# _wait_for_responses_to_flush is the real guarantee; this is the floor.
+_RELOAD_GRACE_SECONDS = 1.5
+_RELOAD_FLUSH_TIMEOUT_SECONDS = 5.0
+_reload_request = {"pending": False, "requested_at": 0.0, "not_before": 0.0,
+                   "by": ""}
+_reload_result = {}
+
+
+def request_reload(reason=""):
+    """Schedule a package reload for the next adjust tick.
+
+    What it refreshes: everything under bigqmt_signal_trader/, by purging it
+    from sys.modules and re-running init(). That covers the adapters, the RPC
+    handlers, the models and the transports -- where nearly all changes land.
+
+    What it CANNOT refresh, and no amount of importlib will: this file and the
+    BIGQMT_REDIS_DRYRUN entry. QMT execs those itself, and a module cannot
+    reload the module it is running in. Those still need a strategy restart.
+
+    Deliberately explicit: reloading a live trading process is not free. QMT's
+    order/deal callbacks run on a C++ thread, and the first exec of a
+    not-yet-imported module there fails in the C layer without setting a Python
+    exception (SystemError: error return without exception set). The reload runs
+    on the adjust thread and the callback path holds its own reference to
+    exec_events from module load, so a callback landing mid-reload keeps using
+    the old module rather than importing anything -- but the window is real,
+    which is why this never fires on its own.
+    """
+    _reload_request["pending"] = True
+    _reload_request["requested_at"] = time.time()
+    _reload_request["not_before"] = time.time() + _RELOAD_GRACE_SECONDS
+    _reload_request["by"] = str(reason or "")
+    return {
+        "scheduled": True,
+        "note": "reload runs on the next adjust tick; poll get_deployment_info "
+                "or reload_status to see the result",
+        "version_before": _package_version(),
+    }
+
+
+def reload_status():
+    """The outcome of the last reload, or what is still pending."""
+    status = dict(_reload_result)
+    status["pending"] = bool(_reload_request["pending"])
+    status["requested_at"] = _reload_request["requested_at"]
+    return status
+
+
+def _package_version():
+    try:
+        if _load_bridge_module is not None:
+            module = _load_bridge_module("bigqmt_signal_trader.version")
+        else:
+            from bigqmt_signal_trader import version as module
+        return str(getattr(module, "__version__", ""))
+    except Exception:
+        return ""
+
+
+def _purge_package_modules():
+    """Drop every bigqmt_signal_trader module so the next import reads source.
+
+    Purging beats importlib.reload here: reload has to run in dependency order
+    (order_bigqmt does `from ..models import OrderSnapshot` at import time, so
+    reloading models after it leaves the old class bound), and getting that
+    order wrong fails silently. A purge has no order.
+    """
+    names = [name for name in list(sys.modules)
+             if name == "bigqmt_signal_trader"
+             or name.startswith("bigqmt_signal_trader.")]
+    for name in names:
+        sys.modules.pop(name, None)
+    return sorted(names)
+
+
+def _rebind_module_level_imports():
+    """Re-point the names this module bound at import time.
+
+    Purging sys.modules does nothing for references already held here --
+    _default_build_app, the runner functions, BigQmtRuntimeAdapter and
+    _exec_events would all keep pointing at the old objects, and the reload
+    would look like it worked while changing nothing.
+    """
+    global _adapter_factory, _runner, _runtime_bigqmt, _default_build_app
+    global forward_order_event, forward_trade_event, init_app, _reset_runner_app
+    global sync_positions_app, tick_app, BigQmtRuntimeAdapter, _exec_events
+
+    if _load_bridge_module is not None:
+        _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+        _runner = _load_bridge_module("bigqmt_signal_trader.runner")
+        _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
+        _default_build_app = _adapter_factory.build_app
+        forward_order_event = _runner.forward_order_event
+        forward_trade_event = _runner.forward_trade_event
+        init_app = _runner.init_app
+        _reset_runner_app = _runner.reset_app
+        sync_positions_app = _runner.sync_positions_app
+        tick_app = _runner.tick_app
+        BigQmtRuntimeAdapter = _runtime_bigqmt.BigQmtRuntimeAdapter
+    else:
+        from bigqmt_signal_trader.adapter_factory import build_app as _bp
+        from bigqmt_signal_trader import runner as _rn
+        from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter as _ra
+
+        _default_build_app = _bp
+        forward_order_event = _rn.forward_order_event
+        forward_trade_event = _rn.forward_trade_event
+        init_app = _rn.init_app
+        _reset_runner_app = _rn.reset_app
+        sync_positions_app = _rn.sync_positions_app
+        tick_app = _rn.tick_app
+        BigQmtRuntimeAdapter = _ra
+    _exec_events = _load_exec_events()
+
+
+def _pending_response_count():
+    """How many RPC replies the transport has queued but not yet sent."""
+    transport = getattr(_rpc_service, "_transport", None) if _rpc_service else None
+    pending = getattr(transport, "_response_queue", None)
+    if pending is None:
+        return 0
+    try:
+        return pending.qsize()
+    except Exception:
+        return 0
+
+
+def _wait_for_responses_to_flush(timeout_seconds=None):
+    """Let the transport send what is queued before reset_app() tears it down.
+
+    The reply to reload_deployment is put on the ZMQ transport's response queue
+    by the handler, and the ROUTER thread sends it at the top of its next loop
+    -- a loop that can be sitting in recv_multipart for up to RCVTIMEO (1s),
+    and that needs the GIL this thread is holding. Sleeping yields both.
+
+    Sending from here instead is not an option: the ROUTER socket belongs to
+    that thread and ZMQ sockets are not thread-safe -- the same reason it closes
+    its own socket in its finally block.
+
+    Without this the reload SUCCEEDS and the caller still sees a timeout, which
+    is indistinguishable from a reload that killed the bridge. That is what the
+    first two live attempts did: "responded method=reload_deployment ok=True"
+    and "[bigqmt_reload] ok purged=28" in the terminal, TransportTimeout at the
+    client.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = _RELOAD_FLUSH_TIMEOUT_SECONDS
+    deadline = time.time() + max(0.0, timeout_seconds)
+    while time.time() < deadline:
+        if _pending_response_count() == 0:
+            # qsize() drops when the sender dequeues, which is just BEFORE the
+            # send. One more yield so that send completes.
+            time.sleep(0.2)
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _perform_reload(context_info):
+    """Purge, re-import, re-init. Runs on the adjust thread."""
+    global _reload_result
+    _reload_request["pending"] = False
+    started = time.time()
+    before = _package_version()
+    result = {"ok": False, "version_before": before, "version_after": "",
+              "modules_purged": 0, "seconds": 0.0, "error": "",
+              "replies_flushed": False, "by": _reload_request["by"]}
+    try:
+        result["replies_flushed"] = _wait_for_responses_to_flush()
+        if not result["replies_flushed"]:
+            print("[bigqmt_reload] WARNING: %d reply/replies still queued after "
+                  "%.0fs; the caller may see a timeout even though the reload "
+                  "runs" % (_pending_response_count(),
+                            _RELOAD_FLUSH_TIMEOUT_SECONDS))
+        reset_app()
+        result["modules_purged"] = len(_purge_package_modules())
+        _rebind_module_level_imports()
+        init(context_info)
+        result["version_after"] = _package_version()
+        result["ok"] = True
+    except Exception as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        _log_err("reload", "reload failed: %s\n%s"
+                          % (exc, _traceback.format_exc()))
+    result["seconds"] = round(time.time() - started, 3)
+    _reload_result = result
+    print("[bigqmt_reload] %s purged=%d %s -> %s in %.2fs%s"
+          % ("ok" if result["ok"] else "FAILED", result["modules_purged"],
+             before or "?", result["version_after"] or "?", result["seconds"],
+             "" if result["ok"] else "  (" + result["error"] + ") -- RESTART THE STRATEGY"))
+    return result
+
+
 def reset_app():
     global _adjust_logged, _rpc_service, _scheduled_adjust, _last_full_tick_refresh_at, _last_full_tick_market_refresh_at
     global _quote_subscription_service, _exec_event_redis_client
@@ -463,7 +663,36 @@ def _build_rpc_service(context_info, app, config):
         order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
     )
-    handlers.download_job_redis_client = response_redis_client or redis_client
+    # Neither of these may depend on the TRANSPORT. Only a redis transport
+    # builds the two clients above, so on zmq both were None -- and each had a
+    # working counterpart on the other side of that None:
+    #
+    #   download jobs   _pump_download_jobs advances queued jobs on every
+    #                   adjust tick and takes its client from _exec_event_redis,
+    #                   so on zmq the worker ran while submit / get_status /
+    #                   wait answered "download jobs require a Redis client".
+    #                   The worker was running and the door was locked.
+    #   order identity  orders were never remembered at submit time, so a query
+    #                   could never put the strategy name back (issue #133).
+    #
+    # _exec_event_redis is the helper that already covers this case ("only
+    # builds a client when _rpc_service has none, which is the zmq-transport
+    # case") and caches it -- its docstring says what building one per call
+    # cost. No redis configured at all leaves both None, and both stores treat
+    # that as "feature off", never as an error.
+    _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
+    handlers.download_job_redis_client = _store_redis
+    handlers.order_identity_redis_client = _store_redis
+    # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
+    # needs it: with the redis client now wired on every transport, a submit
+    # would otherwise be accepted into a queue that nothing drains.
+    # Lets reload_deployment re-import the package and re-run init without a
+    # strategy restart. The handlers cannot reach this module's own functions
+    # any other way.
+    handlers.reload_hook = request_reload
+    handlers.reload_status_hook = reload_status
+    handlers.download_jobs_enabled = _config_bool(
+        (config.get("download_jobs") or {}).get("enabled"), False)
     handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
     handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
@@ -1097,6 +1326,14 @@ def adjust(ContextInfo, _source="timer"):
     _record_adjust_source(_source)
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
+    # AFTER the drain, and not on the tick that scheduled it. The drain is what
+    # flushes queued RPC responses, and reset_app() tears the transport down
+    # with any reply still in it -- reloading first killed the reply to
+    # reload_deployment itself, which the server had already logged as
+    # "responded ok=True" while the client sat there until it timed out.
+    if _reload_request["pending"] and time.time() >= _reload_request["not_before"]:
+        _adjust_phase("reload", _perform_reload, ContextInfo)
+        return None
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
     _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
     try:

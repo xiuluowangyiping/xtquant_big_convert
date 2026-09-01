@@ -70,6 +70,9 @@ READ_METHODS = {
     "query_orders",
     "query_trades",
     "query_execution_snapshot",
+    "describe_trade_detail_fields",
+    "reload_deployment",
+    "reload_status",
     "query_stock_position",
     "sync_positions",
     "submit_download_history_data",
@@ -132,6 +135,8 @@ LISTENER_DEFERRED_METHODS = {
     "query_stock_position",
     "query_orders",
     "query_trades",
+    "describe_trade_detail_fields",
+    "reload_deployment",
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
@@ -521,8 +526,23 @@ class BigQmtRpcHandlers:
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
             "version": _deployed_version(),
+            "account_type": self._reported_account_type(),
             "server_time": _dt.datetime.now(),
         }
+
+    def _reported_account_type(self):
+        """What this deployment will actually trade as.
+
+        The client's StockAccount(..., "CREDIT") never reaches the server --
+        the type comes from BIGQMT_ACCOUNT_TYPE in the QMT-side config -- so a
+        caller declaring CREDIT against a STOCK deployment has no way to see
+        the mismatch. It shows up as an all-zero credit asset row instead
+        (issue #92). Empty when there is no gateway to ask.
+        """
+        gateway = self.order_gateway
+        if gateway is None:
+            return ""
+        return str(getattr(gateway, "account_type", "") or "").strip().upper()
 
     def _handle_get_deployment_info(self, params):
         """Where this bridge is running from, and which build it is.
@@ -674,13 +694,52 @@ class BigQmtRpcHandlers:
         manager.keepalive(client_id, sub_id)
         return {}
 
+    def _identity_redis(self):
+        """Redis for the order-identity store, or None.
+
+        Deliberately its own attribute rather than reusing the download-job
+        client. Only a redis TRANSPORT builds that one, so on a zmq deployment
+        it is None -- which silently meant orders were never remembered at
+        submit time and so could never be attributed on query (issue #133).
+        The strategy wires this one from the redis config whatever the
+        transport, and falls back to the download-job client for deployments
+        that predate it. Everything here treats None as "no attribution",
+        never as an error: naming an order is a nicety, the order is not.
+        """
+        return (getattr(self, "order_identity_redis_client", None)
+                or getattr(self, "download_job_redis_client", None))
+
     def _download_job_redis(self):
         redis_client = getattr(self, "download_job_redis_client", None)
         if redis_client is None:
             raise RuntimeError("download jobs require a Redis client")
         return redis_client
 
+    def _require_download_worker(self):
+        """Refuse to queue work nothing is going to pick up.
+
+        The worker is _pump_download_jobs on the adjust tick, and it is OFF by
+        default on Big QMT for the reason the runtime records: the terminal's
+        embedded xtdata SDK has no reachable data service, so a download would
+        raise 无法连接行情服务 anyway. Same root cause as the download_* methods
+        in #130.
+
+        Accepting a job into a queue no one drains looks like success and never
+        completes -- worse than the refusal it replaces. So say no, and say
+        which switch turns it on.
+        """
+        if not getattr(self, "download_jobs_enabled", False):
+            raise RuntimeError(
+                "async download jobs are disabled on this deployment, so a "
+                "submitted job would sit in the queue forever: nothing runs it. "
+                "Big QMT's embedded xtdata SDK has no reachable data service to "
+                "download through. Supplement history from the terminal's "
+                "数据管理/补充数据 UI and read it back with get_market_data_ex / "
+                "get_local_data. Set download_jobs_enabled=True in the local "
+                "config only where a MiniQMT/xtdata data service is reachable.")
+
     def _handle_submit_download_history_data2(self, params):
+        self._require_download_worker()
         from .download_jobs import submit_download_job
 
         stock_list = params.get("stock_list") or params.get("stock_code") or []
@@ -790,12 +849,13 @@ class BigQmtRpcHandlers:
             str(params.get("strategy_name") or ""),
         )
         if _bool_value(params.get("cancelable_only"), False):
-            return [
+            orders = [
                 order
                 for order in orders
                 if str(getattr(order, "status", "") or "") in CANCELABLE_ORDER_STATUSES
             ]
-        return orders
+        return self._attribute_to_strategies(
+            self._request_account_id(params), orders)
 
     def _handle_query_trades(self, params):
         if self.order_gateway is None:
@@ -805,10 +865,92 @@ class BigQmtRpcHandlers:
         strategy_name = params.get("strategy_name")
         if strategy_name is None:
             strategy_name = ""
-        return self.order_gateway.query_trades(
-            self._request_account_id(params),
-            str(strategy_name),
+        account_id = self._request_account_id(params)
+        return self._attribute_to_strategies(
+            account_id,
+            self.order_gateway.query_trades(account_id, str(strategy_name)),
         )
+
+    def _attribute_to_strategies(self, account_id, snapshots):
+        """Put the strategy name back on rows QMT could not name (issue #133).
+
+        Neither the ORDER nor the DEAL rows get_trade_detail_data returns carry
+        m_strStrategyName -- checked by listing every attribute on a live
+        terminal. QMT filters by strategy but does not report it, which is why
+        this field read as "" for everything.
+
+        Orders this bridge submitted are remembered at submit time, keyed by
+        the user_order_id that rides out as the order remark, so those can be
+        named. Orders placed by hand in the terminal have no remark and stay
+        unnamed; there is nothing to recover for them.
+        """
+        rows = list(snapshots or [])
+        unnamed = [row for row in rows
+                   if not str(getattr(row, "strategy_name", "") or "").strip()]
+        if not unnamed:
+            return rows
+        redis_client = self._identity_redis()
+        if redis_client is None:
+            return rows
+        try:
+            from .exec_events import order_identity_map
+
+            identities = order_identity_map(
+                redis_client, account_id,
+                [getattr(row, "user_order_id", "") for row in unnamed])
+        except Exception:
+            return rows
+        for row in unnamed:
+            identity = identities.get(
+                str(getattr(row, "user_order_id", "") or "").strip())
+            if identity and identity.get("strategy_name"):
+                row.strategy_name = str(identity.get("strategy_name") or "")
+        return rows
+
+    def _handle_describe_trade_detail_fields(self, params):
+        """Report which attributes QMT's ORDER / DEAL rows carry. Names only.
+
+        Answers "why is field X empty / missing" without another
+        deploy-and-restart round trip -- see BigQmtOrderGateway
+        .describe_detail_fields. Deferred to the main thread with the other
+        trade-context queries: get_trade_detail_data returns EMPTY off it.
+        """
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        describe = getattr(self.order_gateway, "describe_detail_fields", None)
+        if describe is None:
+            raise RuntimeError(
+                "this deployment predates describe_trade_detail_fields; "
+                "sync and restart the strategy")
+        detail_types = params.get("detail_types") or params.get("detail_type")
+        if isinstance(detail_types, str):
+            detail_types = [detail_types]
+        return describe(self._request_account_id(params), detail_types)
+
+    def _handle_reload_deployment(self, params):
+        """Re-import the package and re-run init, without a strategy restart.
+
+        Only schedules it: the reload calls reset_app(), which stops the RPC
+        service answering this very request, so the reply has to go out first.
+        It runs on the next adjust tick -- poll reload_status.
+
+        Refreshes everything under bigqmt_signal_trader/. Cannot refresh the
+        strategy file or the entry script: QMT execs those, and a module cannot
+        reload the one it is running in. Those still need a restart.
+        """
+        hook = getattr(self, "reload_hook", None)
+        if hook is None:
+            raise RuntimeError(
+                "this deployment cannot reload itself (it predates "
+                "reload_deployment); sync and restart the strategy once, after "
+                "which reloads no longer need a restart")
+        return hook(str((params or {}).get("reason") or ""))
+
+    def _handle_reload_status(self, params):
+        status_hook = getattr(self, "reload_status_hook", None)
+        if status_hook is None:
+            raise RuntimeError("this deployment predates reload_deployment")
+        return status_hook()
 
     def _handle_query_execution_snapshot(self, params):
         if self.order_gateway is None:
@@ -1117,6 +1259,16 @@ class BigQmtRpcHandlers:
             raise ValueError(
                 "order_type %s has no implicit buy/sell side; pass action "
                 "explicitly" % raw)
+        # Futures (0-15) and ETF option (50-59) opTypes carry the side in the
+        # type itself. 行权/锁定 (56-59) do not, so they fall through to the
+        # same "pass action explicitly" rejection as 直接还款.
+        passthrough = _passthrough_action_of(raw)
+        if passthrough:
+            return passthrough
+        if _passthrough_optype_of(raw) is not None:
+            raise ValueError(
+                "order_type %s has no implicit buy/sell side; pass action "
+                "explicitly" % raw)
         if raw in (None, ""):
             raise ValueError("action or order_type is required")
         # An order_type WAS supplied and was not recognised. Saying "required"
@@ -1144,10 +1296,24 @@ class BigQmtRpcHandlers:
         except Exception:
             return "unknown version"
 
-    def _credit_order_type_from_params(self, params):
-        """The MiniQMT order_type to forward, when it is a credit operation."""
+    def _forwarded_order_type(self, params):
+        """The order_type to forward untouched to passorder, or None.
+
+        Credit (27-32/40-45/70-75) and futures/option (0-15/50-59) opTypes both
+        encode more than a side, so submit() needs the raw value. Read straight
+        from params -- no state is carried between calls, so this does not
+        depend on the order OrderRequest's keyword arguments happen to be
+        evaluated in.
+        """
         raw = params.get("order_type")
-        return raw if _credit_optype_of(raw) is not None else None
+        if _credit_optype_of(raw) is not None:
+            return raw
+        if _passthrough_optype_of(raw) is not None:
+            return raw
+        return None
+
+    # 旧名保留：外部调用方和既有测试还在用
+    _credit_order_type_from_params = _forwarded_order_type
 
     def _handle_submit_order(self, params):
         if self.order_gateway is None:
@@ -1167,7 +1333,7 @@ class BigQmtRpcHandlers:
             price_type=params.get("price_type") or "LIMIT",
             strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
             remark=order_tag,
-            order_type=self._credit_order_type_from_params(params),
+            order_type=self._forwarded_order_type(params),
         )
         if request.action not in ("BUY", "SELL"):
             raise ValueError("action must be BUY or SELL")
@@ -1180,7 +1346,7 @@ class BigQmtRpcHandlers:
             from .exec_events import remember_order_identity
 
             remember_order_identity(
-                getattr(self, "download_job_redis_client", None),
+                self._identity_redis(),
                 request.account_id,
                 request.remark,
                 strategy_name=request.strategy_name,
@@ -1435,6 +1601,24 @@ def _credit_optype_of(order_type):
         from bigqmt_signal_trader.adapters.order_bigqmt import credit_optype_of
 
         return credit_optype_of(order_type)
+    except Exception:
+        return None
+
+
+def _passthrough_optype_of(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import passthrough_optype_of
+
+        return passthrough_optype_of(order_type)
+    except Exception:
+        return None
+
+
+def _passthrough_action_of(order_type):
+    try:
+        from bigqmt_signal_trader.adapters.order_bigqmt import passthrough_action_of
+
+        return passthrough_action_of(order_type)
     except Exception:
         return None
 
