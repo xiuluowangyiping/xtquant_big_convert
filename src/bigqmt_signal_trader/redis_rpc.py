@@ -187,6 +187,20 @@ METHOD_ALIASES = {
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
 SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
+CANCELED_ORDER_STATUSES = {"53", "54"}
+
+# Default 投资备注 / strategy name on an order the caller did not name.
+# QMT shows it in the 委托 list's 报单来源 column (issue #154), so it is
+# visible to anyone reading that screen. Override per call with
+# strategy_name=, or once with rpc_default_strategy_name in the config;
+# "" leaves the column blank the way a hand-placed order does.
+DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
+TERMINAL_NON_CANCEL_ORDER_STATUSES = {"56", "57"}
+# 51 已报待撤 / 52 部成待撤: the exchange has ACCEPTED the cancel and it is
+# on its way. Neither cancelled nor failed -- keep waiting, and at the
+# deadline report the acceptance instead of a "still status 51" failure
+# (issue #151; the narrow-window twin of the #148 false negative).
+CANCEL_IN_FLIGHT_STATUSES = {"51", "52"}
 SAFE_B64_PREFIX = "b64s:"
 SAFE_B64_DIGIT_ENCODE = str.maketrans("0123456789", "!#$%&()*~?")
 SAFE_B64_DIGIT_DECODE = str.maketrans("!#$%&()*~?", "0123456789")
@@ -249,8 +263,13 @@ MARKET_DATA_METHODS = {
     "get_north_finance_change",
     "get_hkt_statistics",
     "get_hkt_details",
-    # 自定义板块（写）
+    # 自定义板块（写）。issue #143：这一族以前只有 create_sector，而它在大 QMT
+    # 上是静默空操作；其余几个在白名单里有名字却没实现，调用报 not implemented。
     "create_sector",
+    "create_sector_folder",
+    "add_stock_to_sector",
+    "remove_stock_from_sector",
+    "reset_sector_stock_list",
     # 基础查询辅助
     "get_stock_name",
     "get_stock_type",
@@ -437,6 +456,31 @@ class OrderSettlement(object):
         self.response = None
 
 
+class CancelSettlement(object):
+    """One native cancel result awaiting the order's actual status.
+
+    Full QMT's injected ``cancel`` return is not reliable across terminal
+    builds -- in either direction.  On Guojin 2.1.19.0 it returned falsey
+    even though the broker acknowledged the request and the order moved to
+    status 54 within 67 ms (issue #148), and truthy for orders that do not
+    exist at all (issue #151).  Like order-id settlement, status readback
+    must stay on the adjust thread because get_trade_detail_data is empty on
+    worker threads.
+    """
+
+    __slots__ = ("order_ref", "account_id", "result", "deadline", "attempts",
+                 "request", "response")
+
+    def __init__(self, order_ref, account_id, result, deadline):
+        self.order_ref = order_ref
+        self.account_id = account_id
+        self.result = result
+        self.deadline = deadline
+        self.attempts = 0
+        self.request = None
+        self.response = None
+
+
 class BigQmtRpcHandlers:
     """Whitelisted RPC method handlers backed by replaceable adapters."""
 
@@ -453,7 +497,18 @@ class BigQmtRpcHandlers:
         settle_orders_inline=False,
         order_settle_timeout_seconds=3.0,
         quote_subscription_manager=None,
+        default_strategy_name=None,
     ):
+        # What an order carries when the caller names no strategy. It is not
+        # internal: QMT puts it in the 委托 list's 报单来源 column, so every
+        # order announces "bigqmt_rpc" to anyone reading that screen, and a
+        # reporter asked to be rid of it (issue #154). Per-call
+        # strategy_name= always won; there was just no way to set the default
+        # once. Empty string is a real answer here -- it leaves the column
+        # blank, the way a hand-placed order does.
+        self.default_strategy_name = (
+            DEFAULT_ORDER_STRATEGY_NAME if default_strategy_name is None
+            else str(default_strategy_name))
         self.account_id = str(account_id or "")
         self.market_data = market_data
         self.position_provider = position_provider
@@ -603,11 +658,18 @@ class BigQmtRpcHandlers:
     )
 
     # probe 时抽查的 ContextInfo 方法。
+    # 板块写入那几个是为 issue #142 加的：读取（get_sector_list /
+    # get_stock_list_in_sector）确认可用，而写入走的是哪条通道一直没验过 ——
+    # 官方文档把 create_sector(parent_node, sector_name, overwrite) 记为 QMT
+    # 全局函数，本仓库却按 ContextInfo.create_sector(sectorname, stocklist) 调。
+    # 只探测存在性，不调用：create_sector 是写操作。
     _PROBE_CONTEXT_METHODS = (
         "get_full_tick", "get_market_data_ex", "get_market_data", "get_local_data",
         "subscribe_quote", "subscribe_whole_quote", "unsubscribe_quote",
         "get_trading_dates", "get_financial_data", "get_stock_list_in_sector",
         "do_back_test", "get_trade_detail_data",
+        "get_sector_list", "create_sector", "create_sector_folder",
+        "add_sector", "remove_sector", "remove_stock_from_sector", "reset_sector",
     )
 
     def _handle_probe_capabilities(self, params):
@@ -632,6 +694,21 @@ class BigQmtRpcHandlers:
         context_info = getattr(self.market_data, "context_info", None)
         for name in self._PROBE_CONTEXT_METHODS:
             info["contextinfo_methods"][name] = callable(getattr(context_info, name, None))
+        # 板块写入的全局函数通道（issue #142）。注意 False 的含义有限：QMT 把全局
+        # 只注入 *被挂载的那个文件* 的命名空间（PR #134 修的就是这件事），而这里
+        # 看到的是本模块的 globals + builtins + 策略捕获过的 qmt_api。所以
+        # True 说明确实拿得到，False 只说明「这条路径上没有」，不等于终端没有。
+        info["global_namespace"] = {}
+        for name in ("create_sector", "create_sector_folder", "add_sector",
+                     "remove_sector", "remove_stock_from_sector", "reset_sector"):
+            found = self.qmt_api.get(name)
+            if not callable(found):
+                try:
+                    import builtins
+                    found = globals().get(name) or getattr(builtins, name, None)
+                except Exception:
+                    found = None
+            info["global_namespace"][name] = callable(found)
         # 信用接口只读探测：不存在的全局直接标 unavailable；存在的真调一次，
         # 记录是否报错和返回行数（担保品/融券标的可能很多行，只计数）。
         for name in ("get_assure_contract", "get_enable_short_contract",
@@ -650,7 +727,87 @@ class BigQmtRpcHandlers:
                     "available": True, "ok": False,
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                 }
+        info["sector_probe"] = self._probe_sector_channels()
         return info
+
+    # 板块通道探测（issue #143）。写入板块有三条可能的通道，名字还各不相同：
+    #   * ContextInfo.create_sector           大 QMT 内置 Python
+    #   * 原生 xtdata.add_sector/remove_sector MiniQMT SDK（要行情服务）
+    #   * QMT 注入的全局函数                   文档 §4.7 那一族
+    # 哪条能用只有终端自己知道，所以枚举而不是查固定表 —— 上面那两个 block
+    # 就是查表，于是 add_stock_to_sector / reset_sector_stock_list 根本没被
+    # 看见过。全部只读：不建板块、不改成分股。
+    _SECTOR_WRITE_NAMES = (
+        "create_sector", "create_sector_folder", "add_stock_to_sector",
+        "remove_stock_from_sector", "reset_sector_stock_list",
+        "add_sector", "remove_sector", "reset_sector",
+    )
+
+    @staticmethod
+    def _enumerate_sector_names(target):
+        if target is None:
+            return []
+        try:
+            return sorted(n for n in dir(target)
+                          if "sector" in n.lower() and callable(getattr(target, n, None)))
+        except Exception:
+            return []
+
+    def _probe_sector_channels(self):
+        report = {}
+        context_info = getattr(self.market_data, "context_info", None)
+        report["contextinfo_sector_names"] = self._enumerate_sector_names(context_info)
+        report["qmt_global_sector_names"] = sorted(
+            name for name, func in (self.qmt_api or {}).items()
+            if "sector" in name.lower() and callable(func))
+        report["write_names_found"] = {
+            name: {
+                "contextinfo": callable(getattr(context_info, name, None)),
+                "qmt_global": callable((self.qmt_api or {}).get(name)),
+            }
+            for name in self._SECTOR_WRITE_NAMES
+        }
+
+        native = None
+        try:
+            from .adapters.market_bigqmt import _load_native_xtdata
+
+            native = _load_native_xtdata()
+        except Exception as exc:
+            report["native_xtdata_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        report["native_xtdata_loaded"] = native is not None
+        report["native_sector_names"] = self._enumerate_sector_names(native)
+        for name in self._SECTOR_WRITE_NAMES:
+            if name in report["write_names_found"]:
+                report["write_names_found"][name]["native_xtdata"] = callable(
+                    getattr(native, name, None))
+
+        # 唯一真调的一次，而且是读：它回答「这台终端到底能不能列出真实板块」,
+        # 也就是 get_sector_list 现在是不是在拿硬编码兜底冒充真数据。
+        if native is not None and callable(getattr(native, "get_sector_list", None)):
+            try:
+                listing = native.get_sector_list() or []
+                report["native_get_sector_list"] = {
+                    "ok": True, "count": len(listing),
+                    "sample": [str(x) for x in list(listing)[:8]],
+                }
+            except Exception as exc:
+                report["native_get_sector_list"] = {
+                    "ok": False, "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        else:
+            report["native_get_sector_list"] = {"ok": False, "error": "not available"}
+        try:
+            reported = self.market_data.get_sector_list() or []
+            fallback = list(getattr(self.market_data, "_FALLBACK_SECTORS", ()) or ())
+            report["get_sector_list_now"] = {
+                "count": len(reported),
+                "is_the_hardcoded_fallback": list(reported) == fallback,
+                "sample": [str(x) for x in list(reported)[:8]],
+            }
+        except Exception as exc:
+            report["get_sector_list_now"] = {
+                "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        return report
 
     # ------------------------------------------------------------------
     # 全推行情订阅控制（引用计数共享 ContextInfo.subscribe_whole_quote）。
@@ -925,6 +1082,12 @@ class BigQmtRpcHandlers:
         detail_types = params.get("detail_types") or params.get("detail_type")
         if isinstance(detail_types, str):
             detail_types = [detail_types]
+        shape_fields = params.get("shape_fields") or params.get("shape_field")
+        if isinstance(shape_fields, str):
+            shape_fields = [shape_fields]
+        if shape_fields:
+            return describe(self._request_account_id(params), detail_types,
+                            shape_fields=shape_fields)
         return describe(self._request_account_id(params), detail_types)
 
     def _handle_reload_deployment(self, params):
@@ -958,7 +1121,7 @@ class BigQmtRpcHandlers:
         account_id = self._request_account_id(params)
         order_name = params.get("order_strategy_name")
         if order_name is None:
-            order_name = params.get("strategy_name", "bigqmt_signal_trader")
+            order_name = params.get("strategy_name", self.default_strategy_name)
         trade_name = params.get("trade_strategy_name")
         if trade_name is None:
             trade_name = ""
@@ -1331,7 +1494,8 @@ class BigQmtRpcHandlers:
             volume=int(params.get("volume") or params.get("order_volume") or 0),
             price=float(price if price not in (None, "") else 0),
             price_type=params.get("price_type") or "LIMIT",
-            strategy_name=str(params.get("strategy_name") or "bigqmt_rpc"),
+            strategy_name=str(params.get("strategy_name")
+                              or self.default_strategy_name),
             remark=order_tag,
             order_type=self._forwarded_order_type(params),
         )
@@ -1421,6 +1585,29 @@ class BigQmtRpcHandlers:
                         settlement.result.order_sys_id = sysid
                     except Exception:
                         pass
+                    return True
+                # The row is there but m_strOrderSysID is not populated yet.
+                # Settling here publishes order_sys_id=None, the client turns
+                # that into -1, and a LIVE order is reported as ORDER_REJECTED
+                # -- a caller who retries on rejection double-orders. Measured
+                # on Guojin 2.1.19.0: the id was present on an immediate manual
+                # readback right after the -1 (issue #152). So keep waiting;
+                # the row already proves the order reached the broker.
+                if not final:
+                    return False
+                message = (
+                    "ORDER IS LIVE -- DO NOT RESUBMIT. passorder reached the "
+                    "broker and the order row exists (stock=%s action=%s "
+                    "price=%.2f volume=%d), but QMT had still not assigned "
+                    "order_sys_id after %d lookup(s), so this reply carries no "
+                    "id. Find it by remark %r, or in the 委托 list; it is not a "
+                    "rejection (issue #152)."
+                    % (request.stock_code, request.action, request.price,
+                       request.volume, settlement.attempts, request.remark)
+                )
+                settlement.server_error = message
+                if inline:
+                    self._last_server_error = message
                 return True
             if not final:
                 # Not there yet. QMT assigns the id asynchronously, so an early
@@ -1470,7 +1657,7 @@ class BigQmtRpcHandlers:
         strategy_name = str(
             params.get("strategy_name")
             or (orders[0] or {}).get("strategy_name")
-            or "bigqmt_rpc"
+            or self.default_strategy_name
         )
         existing_by_tag = {}
         lookup_ok = True
@@ -1571,12 +1758,116 @@ class BigQmtRpcHandlers:
     def _handle_cancel_order(self, params):
         if self.order_gateway is None:
             raise RuntimeError("order_gateway is not configured")
+        account_id = self._request_account_id(params)
         order_sys_id = str(params.get("order_sys_id") or params.get("order_sysid") or params.get("order_id") or "")
         if not order_sys_id:
             raise ValueError("order_sys_id or order_id is required")
-        return self.order_gateway.cancel(
-            OrderRef(order_sys_id=order_sys_id, user_order_id=str(params.get("user_order_id") or ""))
+        order_ref = OrderRef(
+            order_sys_id=order_sys_id,
+            user_order_id=str(params.get("user_order_id") or ""),
         )
+        result = self.order_gateway.cancel(order_ref)
+
+        # The native cancel return is not trustworthy in EITHER direction.
+        # #148: falsey while the broker accepted the cancel (status became 54
+        # within 67 ms).  #151: truthy for an order that does not exist at
+        # all -- the return describes "the request was sent", not "the order
+        # was cancelled".  So both directions settle against the order
+        # snapshot now.  A truthy return gets ONE immediate lookup first: the
+        # common case (order exists, already 53/54) confirms without an extra
+        # round trip, so the fast path stays fast; only an unconfirmed truthy
+        # pays the settle wait.
+        settlement = CancelSettlement(
+            order_ref,
+            account_id,
+            result,
+            _monotonic() + self.order_settle_timeout_seconds,
+        )
+        if getattr(result, "success", None) is not False:
+            try:
+                if self._apply_cancel_lookup(settlement):
+                    return result
+            except Exception:
+                pass  # fall through to the parked/inline wait below
+        if self.settle_orders_inline:
+            try:
+                import time as _time
+                _time.sleep(self.order_settle_timeout_seconds)
+                self._apply_cancel_lookup(settlement, final=True)
+            except Exception:
+                pass
+        else:
+            self._pending_settlement = settlement
+        return result
+
+    def _apply_cancel_lookup(self, settlement, final=False):
+        """Resolve an ambiguous native cancel return from the order snapshot."""
+        settlement.attempts += 1
+        order_sys_id = str(settlement.order_ref.order_sys_id or "")
+        try:
+            strict_query = getattr(self.order_gateway, "query_orders_strict", None)
+            if callable(strict_query):
+                orders = strict_query(settlement.account_id, "") or []
+            else:
+                orders = self.order_gateway.query_orders(settlement.account_id, "") or []
+        except Exception as exc:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel status lookup failed after %d attempt(s): %s: %s"
+                % (settlement.attempts, exc.__class__.__name__, exc)
+            )
+            return True
+
+        matches = [
+            order for order in orders
+            if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
+        ]
+        if not matches:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel was not confirmed: order %s was not found after %d lookup(s)"
+                % (order_sys_id, settlement.attempts)
+            )
+            return True
+
+        status = str(getattr(matches[0], "status", "") or "")
+        if status in CANCELED_ORDER_STATUSES:
+            settlement.result.success = True
+            settlement.result.message = ""
+            return True
+        if status in TERMINAL_NON_CANCEL_ORDER_STATUSES:
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel was not confirmed: order %s reached status %s"
+                % (order_sys_id, status)
+            )
+            return True
+        if status in CANCEL_IN_FLIGHT_STATUSES:
+            if not final:
+                return False
+            # The exchange has accepted the cancel and it is on its way --
+            # 51/52 transition to 54 in milliseconds normally, slower around
+            # the close or under congestion. That is not a failed cancel, and
+            # reporting one is the #148 false negative through a narrower
+            # window (issue #151).
+            settlement.result.success = True
+            settlement.result.message = (
+                "cancel accepted by exchange, still in flight: order %s is status %s"
+                % (order_sys_id, status)
+            )
+            return True
+        if not final:
+            return False
+        settlement.result.success = False
+        settlement.result.message = (
+            "cancel was not confirmed after %d lookup(s): order %s is still status %s"
+            % (settlement.attempts, order_sys_id, status or "unknown")
+        )
+        return True
 
 
 def _bool_value(value, default=False):
@@ -1756,9 +2047,9 @@ class RedisPubSubRpcService:
         self._deferred_count = 0
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
-        # Orders whose reply is waiting on QMT assigning an order id. Unbounded
-        # on purpose: every entry is an order that already reached the broker,
-        # so dropping one would strand a live order with no reply.
+        # Submit/cancel replies waiting on a main-thread order snapshot.
+        # Unbounded on purpose: every entry represents a live broker operation,
+        # so dropping one would strand it with no reply.
         self._pending_settlements = queue.Queue()
         self._running = threading.Event()
         self._thread = None
@@ -1950,7 +2241,7 @@ class RedisPubSubRpcService:
         return payload
 
     def settle_pending_orders(self, max_items=100):
-        """Retry parked order lookups. MUST be called from the adjust thread.
+        """Retry parked submit/cancel lookups on the adjust thread.
 
         A queue rather than a list because rpc_listener_methods is configurable:
         if submit_order is ever put in it, the producer becomes the listener
@@ -1971,7 +2262,10 @@ class RedisPubSubRpcService:
                 break
             expired = _monotonic() >= settlement.deadline
             try:
-                done = self.handlers._apply_order_lookup(settlement, final=expired)
+                if isinstance(settlement, CancelSettlement):
+                    done = self.handlers._apply_cancel_lookup(settlement, final=expired)
+                else:
+                    done = self.handlers._apply_order_lookup(settlement, final=expired)
             except Exception:
                 done = True  # never strand a submitted order in the queue
             if not done:
@@ -1980,7 +2274,7 @@ class RedisPubSubRpcService:
             response = settlement.response
             response["data"] = to_jsonable(settlement.result)
             response["ok"] = True
-            if settlement.server_error:
+            if getattr(settlement, "server_error", ""):
                 response["server_error"] = settlement.server_error
             response["handled_at"] = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             try:
@@ -2072,9 +2366,10 @@ class RedisPubSubRpcService:
             server_error = getattr(self.handlers, "_last_server_error", None)
             if server_error:
                 response["server_error"] = str(server_error)
-            # passorder already ran, but QMT assigns the order id asynchronously.
-            # Park the reply instead of sleeping on this thread; a later adjust
-            # tick settles and publishes it (issue #44).
+            # passorder may still be awaiting its asynchronously assigned id;
+            # a falsey native cancel may still be awaiting a reliable terminal
+            # status (#148). Park either reply instead of sleeping on this
+            # thread; a later adjust tick settles and publishes it (#44).
             take = getattr(self.handlers, "take_pending_settlement", None)
             settlement = take() if callable(take) else None
             if settlement is not None:

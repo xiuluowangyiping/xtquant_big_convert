@@ -19,6 +19,13 @@ _CONFIG = {}
 _QMT_API = {}
 _RUNTIME = None
 
+# How long a shutdown waits for the external strategy to collect its result
+# before releasing the port anyway. Long enough for a client parked in
+# next_bar to be told `done` and come back for finish() (two round trips on a
+# loopback socket), short enough that a client which walked away does not
+# strand the fixed port for the next run (issue #109).
+_STOP_GRACE_SECONDS = 10.0
+
 
 def configure(**kwargs):
     _CONFIG.update(kwargs)
@@ -571,6 +578,21 @@ class QmtNativeBacktestSession(object):
             self._condition.notify_all()
             return self._result_unlocked()
 
+    def wait_for_result_collected(self, timeout_seconds):
+        """Block until the external strategy has called finish(), or time out.
+
+        The shutdown path uses this to hand the client its ending before the
+        socket goes away (issue #150). finish() notifies, so in the normal case
+        this returns as soon as the client has its result.
+        """
+        with self._condition:
+            if self.finished:
+                return True
+            if not self.started:
+                return False        # nobody ever attached; nothing to wait for
+            return bool(self._condition.wait_for(
+                lambda: self.finished, timeout=timeout_seconds))
+
     def _result_unlocked(self):
         return {
             "schema_version": 1,
@@ -685,6 +707,8 @@ class QmtBacktestBridgeRuntime(object):
     def __init__(self, config=None, qmt_api=None):
         config = dict(config or {})
         bind_endpoint = str(config.pop("bind_endpoint", "tcp://127.0.0.1:16662"))
+        self.stop_grace_seconds = float(
+            config.pop("stop_grace_seconds", _STOP_GRACE_SECONDS))
         self.engine = QmtNativeBacktestSession(config=config, qmt_api=qmt_api)
         self.protocol = BacktestBridgeProtocol(self.engine)
         self.server = ZmqBacktestServer(self.protocol, endpoint=bind_endpoint, exit_on_finish=True)
@@ -723,6 +747,16 @@ class QmtBacktestBridgeRuntime(object):
 
     def on_qmt_stop(self):
         self.engine.on_qmt_stop()
+
+    def wait_for_client_result(self, timeout_seconds=None):
+        """Give a running client time to read ``done`` and collect finish().
+
+        Bounded on purpose: a client that walked away must not strand the
+        port (issue #109). Returns True only if the client actually collected.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = self.stop_grace_seconds
+        return self.engine.wait_for_result_collected(timeout_seconds)
 
     def stop_server(self, timeout_seconds=5.0):
         """Stop serving and wait for the port to be released.
@@ -786,6 +820,13 @@ def stop(ContextInfo=None):
     """
     if _RUNTIME is not None:
         _RUNTIME.on_qmt_stop()
+        # Hand the client its ending before the socket goes away. on_qmt_stop
+        # wakes a next_bar parked in wait_for, but that reply still has to
+        # travel back over ZMQ, and run() calls finish() immediately after it
+        # breaks on `done` -- tearing down first loses both, and the client
+        # sees "backtest ZMQ request timed out: next_bar" at the end of a run
+        # that actually completed (issue #150).
+        _RUNTIME.wait_for_client_result()
         _RUNTIME.stop_server()
 
 

@@ -1726,16 +1726,43 @@ class BigQmtXtData:
         except Exception:
             pass
 
+    @staticmethod
+    def _served_codes(data):
+        """Codes the server actually served, across both return shapes:
+        get_market_data_ex is code-keyed ({code: DataFrame}), get_market_data
+        is field-keyed ({field: {code: [..]}}) -- reading keys off the wrong
+        level would make every code look missing."""
+        if not isinstance(data, dict):
+            return set()
+        nested = {code for value in data.values() if isinstance(value, dict) for code in value}
+        return nested if nested else set(data.keys())
+
     def _heal_adjusted(self, method, params, data, wait_seconds=2.0, timeout_seconds=None):
-        """Self-heal adjusted reads: if the adjusted pull came back all-zero,
-        trigger a server-side raw download, wait for async landing, retry once."""
+        """Self-heal reads served from an unready raw store: if the adjusted
+        pull came back all-zero, or a none-adjusted pull came back missing
+        most requested codes, trigger a server-side raw download, wait for
+        async landing, retry once."""
         dividend_type = str(params.get("dividend_type") or "none").lower()
-        if dividend_type in ("", "none"):
-            return data
-        if not self._is_all_zero_any(data):
-            return data
         codes = list(params.get("stock_list") or params.get("stock_code") or [])
         if not codes:
+            return data
+        if dividend_type in ("", "none"):
+            # None-adjusted bars are never zero-filled, so the all-zero
+            # detector does not apply -- a *missing* code means the server
+            # has no raw bars for it at all. Big QMT's raw store is not
+            # auto-populated market-wide (a --tick pipeline read 8 of 5225
+            # codes on 2026-08-30 because nothing ever downloaded the raw
+            # dailies), so heal that the same way. But a full-market read
+            # always has a few codes the server can never serve (delisted,
+            # suspended, no quote permission), and healing on *any* missing
+            # code made those a per-call cost -- raw download + sleep + full
+            # re-read, every time. Heal only when the majority came back
+            # missing: that is the raw-store-not-populated signal.
+            served = self._served_codes(data)
+            missing = sum(1 for code in codes if code not in served)
+            if missing < max(1, len(codes) // 2):
+                return data
+        elif not self._is_all_zero_any(data):
             return data
         self._ensure_server_raw(
             codes,
@@ -1972,12 +1999,15 @@ class BigQmtXtData:
 
         ``download_timeout_seconds`` covers the server-side download only; it is
         generous because a cold code with a wide window can take minutes.
+
+        The server-side download is best-effort while the client pull can still
+        save it (cache enabled), but with the local cache disabled it is the
+        entire job -- its failure raises instead of reporting {finished: total},
+        which would be the fake progress of issue #47.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
             return {"finished": 0, "total": 0}
-        if self._local_cache() is None:
-            raise RuntimeError("local cache is disabled (set local_cache_enabled=True to download)")
 
         # Server-side download first, for EVERY dividend_type.
         #
@@ -1996,6 +2026,7 @@ class BigQmtXtData:
         # Adjusted data additionally NEEDS this: QMT computes front/back-adjusted
         # bars from raw bars + dividend factors, and both must exist server-side
         # or the result is all zeros.
+        server_download_error = None
         try:
             self.client.call(
                 "download_history_data2",
@@ -2007,10 +2038,30 @@ class BigQmtXtData:
                 },
                 timeout_seconds=float(download_timeout_seconds),
             )
-        except Exception:
-            # Best-effort: some deployments lack the QMT global; the pull below
-            # may still work if the data already exists server-side.
-            pass
+        except Exception as exc:
+            # Best-effort only while the pull below can still save the
+            # download (data already on the server). With the local cache
+            # disabled there is no pull -- the server-side download is the
+            # whole job, and reporting {finished: total} after a failed one
+            # is the fake progress of issue #47.
+            server_download_error = exc
+
+        if self._local_cache() is None:
+            # local cache disabled: server-side download only (step 1). The
+            # data lands in the server-side DATs, so this is real work -- not
+            # the fake progress download of issue #47. The client pull is
+            # skipped uniformly for every period (tick and bars alike) and
+            # progress is reported per code without any pull.
+            if server_download_error is not None:
+                raise server_download_error
+            total = len(codes)
+            for index, code in enumerate(codes, 1):
+                if callback is not None:
+                    try:
+                        callback({"finished": index, "total": total, "stockcode": code})
+                    except Exception:
+                        pass
+            return {"finished": total, "total": total}
 
         total = len(codes)
         step = int(chunk_size or 300)
@@ -2140,8 +2191,15 @@ class BigQmtXtData:
             callback(result)
         return result
 
-    def get_sector_list(self):
-        return self._call("get_sector_list")
+    def get_sector_list(self, allow_fallback=False):
+        """Sector names, or an error saying the terminal cannot list them.
+
+        ``allow_fallback=True`` opts into the 13 curated well-known names,
+        which still drive ``get_stock_list_in_sector``. Big QMT cannot
+        enumerate real sectors at all, and handing back the curated list
+        unasked made a fake answer indistinguishable from a real one (#143).
+        """
+        return self._call("get_sector_list", allow_fallback=bool(allow_fallback))
 
     def get_sector_info(self, sector_name=""):
         return self._call("get_sector_info", sector_name=sector_name)
@@ -2278,6 +2336,60 @@ class BigQmtXtData:
     def get_option_iv(self, opt_code):
         return self._call("get_option_iv", opt_code=opt_code)
 
+    def get_option_analytics(
+        self,
+        opt_code,
+        option_price=None,
+        underlying_price=None,
+        as_of=None,
+        risk_free_rate=None,
+        dividend_yield=None,
+        price_period="1m",
+        include_native_iv=False,
+    ):
+        """Return client-side IV and Greeks for one option contract."""
+        from .option_analytics_client import get_option_analytics
+
+        return get_option_analytics(
+            self,
+            opt_code,
+            option_price=option_price,
+            underlying_price=underlying_price,
+            as_of=as_of,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            price_period=price_period,
+            include_native_iv=include_native_iv,
+        )
+
+    def get_option_chain_analytics(
+        self,
+        undl_code,
+        dedate,
+        opttype="",
+        isavailavle=False,
+        underlying_price=None,
+        as_of=None,
+        risk_free_rate=None,
+        dividend_yield=None,
+        price_period="1m",
+    ):
+        """Return batched client-side IV and Greeks for one option expiry."""
+        from .option_analytics_client import get_option_chain_analytics
+
+        return get_option_chain_analytics(
+            self,
+            undl_code,
+            dedate,
+            opttype=opttype,
+            isavailavle=isavailavle,
+            underlying_price=underlying_price,
+            as_of=as_of,
+            risk_free_rate=risk_free_rate,
+            dividend_yield=dividend_yield,
+            price_period=price_period,
+        )
+
     def get_option_detail_data(self, stockcode):
         return self._call("get_option_detail_data", stockcode=stockcode)
 
@@ -2316,8 +2428,24 @@ class BigQmtXtData:
     def get_hkt_details(self, stock_code):
         return self._call("get_hkt_details", stock_code=stock_code)
 
+    # 自定义板块写入（issue #143）。每一个都在服务端写入后回读校验，所以
+    # 「没报错」现在真的代表写进去了 —— 以前 create_sector 是静默空操作。
     def create_sector(self, sector_name, stock_list):
         return self._call("create_sector", sector_name=sector_name, stock_list=list(stock_list or []))
+
+    def create_sector_folder(self, parent_node, folder_name, overwrite=False):
+        return self._call("create_sector_folder", parent_node=parent_node,
+                          folder_name=folder_name, overwrite=overwrite)
+
+    def reset_sector_stock_list(self, sector, stock_list):
+        return self._call("reset_sector_stock_list", sector=sector,
+                          stock_list=list(stock_list or []))
+
+    def add_stock_to_sector(self, sector, stock_code):
+        return self._call("add_stock_to_sector", sector=sector, stock_code=stock_code)
+
+    def remove_stock_from_sector(self, sector, stock_code):
+        return self._call("remove_stock_from_sector", sector=sector, stock_code=stock_code)
 
     def get_stock_name(self, stock):
         return self._call("get_stock_name", stock=stock)
@@ -2635,33 +2763,34 @@ class BigQmtXtTrader:
             log.exception("user callback failed: on_account_status")
 
     def _event_loop_push_channel(self):
-        """zmq: exec events arrive on the same PUB socket as whole-quote data.
+        """One push-channel round: zmq exec events arrive on the same PUB
+        socket as whole-quote data.
 
         Reuses _build_quote_push_channel so the address derivation stays in one
-        place. The subscriber runs its own thread, so this loop only keeps the
-        channel alive and rebuilds it if the account changes or it dies.
+        place. Single round: returns when the account changes or the channel
+        dies, so the caller's per-round channel selection runs again (Redis may
+        have come back, or gone away).
         """
         from .exec_events import EXEC_TOPICS
 
         topics = sorted(set(EXEC_TOPICS.values()))
-        while self._event_running:
-            channel = None
-            account_id = str(self.client.account_id or "")
-            try:
-                channel = self._build_quote_push_channel()
-                channel.start_subscriber(topics, self._on_push_exec_event)
-                while self._event_running:
-                    if str(self.client.account_id or "") != account_id:
-                        break      # account changed -> rebuild against the new address
-                    time.sleep(0.5)
-            except Exception:
-                time.sleep(1.0)
-            finally:
-                if channel is not None:
-                    try:
-                        channel.stop()
-                    except Exception:
-                        pass
+        channel = None
+        account_id = str(self.client.account_id or "")
+        try:
+            channel = self._build_quote_push_channel()
+            channel.start_subscriber(topics, self._on_push_exec_event)
+            while self._event_running:
+                if str(self.client.account_id or "") != account_id:
+                    return       # account changed -> rebuild against the new address
+                time.sleep(0.5)
+        except Exception:
+            time.sleep(1.0)
+        finally:
+            if channel is not None:
+                try:
+                    channel.stop()
+                except Exception:
+                    pass
 
     def _on_push_exec_event(self, topic, data):
         """Push-channel callback. The payload is already a decoded dict, unlike
@@ -2672,18 +2801,56 @@ class BigQmtXtTrader:
             pass
 
     def _event_loop(self):
-        """Receive exec events. Redis deployments subscribe to the per-account
-        channels; zmq deployments ride the quote push channel.
+        """Receive exec events, mirroring the server's sink choice.
 
-        Exec events used to be Redis-only, so a zmq deployment received no
-        order/trade callbacks at all -- silently, since the loop just failed to
-        connect and retried forever (issue #76).
+        The server publishes to Redis FIRST whenever it can build a Redis
+        client (its channels carry streams for short replay), even when the
+        RPC transport is zmq, and only falls to the quote push channel after
+        repeated Redis publish failures (strategy _exec_event_sink, issue
+        #145).  This loop used to choose by transport instead -- zmq -> push
+        channel only -- so a zmq deployment with a working Redis published
+        every order/trade event to Redis while the client listened on the
+        push channel: callbacks never fired (issue #144; reproduced
+        2026-09-02, the day's events sat in the Redis stream while a
+        zmq-transport listener saw nothing).
+
+        Re-select per reconnect round, so the client follows a server that
+        demotes Redis mid-session (its Redis publish failing usually means
+        our Redis reads fail too).
         """
-        transport = str(getattr(self.client, "transport_name", "redis") or "redis").lower()
-        if transport == "zmq":
-            self._event_loop_push_channel()
-            return
+        while self._event_running:
+            redis_client = self._exec_events_redis_or_none()
+            if redis_client is not None:
+                self._event_loop_redis(redis_client)
+            elif self._exec_transport_is_zmq():
+                self._event_loop_push_channel()
+            else:
+                # redis transport with redis down: nothing else carries
+                # events; keep retrying as before.
+                time.sleep(1.0)
 
+    def _exec_transport_is_zmq(self):
+        return str(getattr(self.client, "transport_name", "redis") or "redis").lower() == "zmq"
+
+    def _exec_events_redis_or_none(self):
+        """A REACHABLE Redis client for the exec-event channels, or None.
+
+        _redis() only builds the client object; the connection is lazy, so
+        an unreachable server would still return one. Ping it -- the channel
+        choice must reflect reachability, not configuration.
+        """
+        try:
+            client = self.client._redis()
+            if client is None:
+                return None
+            client.ping()
+            return client
+        except Exception:
+            return None
+
+    def _event_loop_redis(self, redis_client):
+        """One Redis round: subscribe the per-account channels until the
+        account changes or the connection dies, then return for re-selection."""
         from .exec_events import (
             order_channel,
             trade_channel,
@@ -2691,32 +2858,31 @@ class BigQmtXtTrader:
             cancel_error_channel,
         )
 
-        while self._event_running:
-            account_id = str(self.client.account_id or "")
-            pubsub = None
+        account_id = str(self.client.account_id or "")
+        pubsub = None
+        try:
+            pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+            pubsub.subscribe(
+                order_channel(account_id),
+                trade_channel(account_id),
+                order_error_channel(account_id),
+                cancel_error_channel(account_id),
+            )
+            while self._event_running:
+                if str(self.client.account_id or "") != account_id:
+                    return  # account changed -> reconnect and resubscribe
+                message = pubsub.get_message(timeout=1.0)
+                if not message or message.get("type") != "message":
+                    continue
+                self._dispatch_event(message.get("data"))
+        except Exception:
+            time.sleep(1.0)
+        finally:
             try:
-                pubsub = self.client._redis().pubsub(ignore_subscribe_messages=True)
-                pubsub.subscribe(
-                    order_channel(account_id),
-                    trade_channel(account_id),
-                    order_error_channel(account_id),
-                    cancel_error_channel(account_id),
-                )
-                while self._event_running:
-                    if str(self.client.account_id or "") != account_id:
-                        break  # account changed -> reconnect and resubscribe
-                    message = pubsub.get_message(timeout=1.0)
-                    if not message or message.get("type") != "message":
-                        continue
-                    self._dispatch_event(message.get("data"))
+                if pubsub is not None:
+                    pubsub.close()
             except Exception:
-                time.sleep(1.0)
-            finally:
-                try:
-                    if pubsub is not None:
-                        pubsub.close()
-                except Exception:
-                    pass
+                pass
 
     def _dispatch_event(self, raw):
         """Accepts raw bytes/str (Redis pub/sub) or an already-decoded dict.

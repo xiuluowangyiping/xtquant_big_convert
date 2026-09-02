@@ -39,8 +39,28 @@ def get_stock_list_in_sector(sector_name, real_timetag=-1):
     return _compat.xtdata.get_stock_list_in_sector(sector_name, real_timetag=real_timetag)
 
 
-def get_sector_list():
-    return _compat.xtdata.get_sector_list()
+def get_sector_list(allow_fallback=False):
+    return _compat.xtdata.get_sector_list(allow_fallback=allow_fallback)
+
+
+def create_sector(sector_name, stock_list):
+    return _compat.xtdata.create_sector(sector_name, stock_list)
+
+
+def create_sector_folder(parent_node, folder_name, overwrite=False):
+    return _compat.xtdata.create_sector_folder(parent_node, folder_name, overwrite)
+
+
+def reset_sector_stock_list(sector, stock_list):
+    return _compat.xtdata.reset_sector_stock_list(sector, stock_list)
+
+
+def add_stock_to_sector(sector, stock_code):
+    return _compat.xtdata.add_stock_to_sector(sector, stock_code)
+
+
+def remove_stock_from_sector(sector, stock_code):
+    return _compat.xtdata.remove_stock_from_sector(sector, stock_code)
 
 
 def get_sector_info(sector_name=""):

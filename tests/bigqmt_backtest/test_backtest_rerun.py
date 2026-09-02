@@ -118,47 +118,51 @@ class RebindTest(unittest.TestCase):
 class StopHookTest(unittest.TestCase):
     """QMT's stop button reaches stop(); it has to reach the server too."""
 
-    def test_stop_calls_stop_server(self):
+    class _FakeRuntime(object):
+        """Records the shutdown order. The order is the whole point: telling
+        the engine the run ended is useless if the socket dies before the
+        client can be told (issue #150)."""
+
+        def __init__(self, calls):
+            self.calls = calls
+
+        def on_qmt_stop(self):
+            self.calls.append("engine")
+
+        def wait_for_client_result(self, timeout_seconds=None):
+            self.calls.append("wait")
+            return True
+
+        def stop_server(self, timeout_seconds=5.0):
+            self.calls.append("server")
+
+    def _run_hook(self, hook_name):
         import bigqmt_backtest.qmt_runtime as runtime
 
         calls = []
-
-        class FakeRuntime(object):
-            def on_qmt_stop(self):
-                calls.append("engine")
-
-            def stop_server(self, timeout_seconds=5.0):
-                calls.append("server")
-
         saved = runtime._RUNTIME
         try:
-            runtime._RUNTIME = FakeRuntime()
-            runtime.stop(None)
+            runtime._RUNTIME = self._FakeRuntime(calls)
+            getattr(runtime, hook_name)(None)
         finally:
             runtime._RUNTIME = saved
+        return calls
 
-        self.assertEqual(calls, ["engine", "server"])
+    def test_stop_calls_stop_server(self):
+        self.assertEqual(self._run_hook("stop"), ["engine", "wait", "server"])
+
+    def test_stop_waits_for_the_client_before_closing_the_socket(self):
+        """#150: the client is parked in next_bar and still has finish() to
+        call. Closing first turns a completed run into a TimeoutError."""
+        calls = self._run_hook("stop")
+
+        self.assertLess(calls.index("wait"), calls.index("server"))
 
     def test_after_backtest_stops_it_too(self):
-        import bigqmt_backtest.qmt_runtime as runtime
-
-        calls = []
-
-        class FakeRuntime(object):
-            def on_qmt_stop(self):
-                calls.append("engine")
-
-            def stop_server(self, timeout_seconds=5.0):
-                calls.append("server")
-
-        saved = runtime._RUNTIME
-        try:
-            runtime._RUNTIME = FakeRuntime()
-            runtime.after_backtest(None)
-        finally:
-            runtime._RUNTIME = saved
+        calls = self._run_hook("after_backtest")
 
         self.assertIn("server", calls)
+        self.assertLess(calls.index("wait"), calls.index("server"))
 
     def test_stop_without_a_runtime_is_harmless(self):
         import bigqmt_backtest.qmt_runtime as runtime

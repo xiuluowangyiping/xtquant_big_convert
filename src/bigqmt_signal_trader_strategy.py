@@ -484,6 +484,32 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     "down_history_data",
 )
 
+# The full set of QMT-injected global function names (the three trade entry
+# points plus the extras above). Mount sites (the RPC runtime's direct mount)
+# capture whatever is callable from their own exec namespace via
+# capture_qmt_injected_funcs() -- this is the single source for that list; do
+# not hand-copy the names elsewhere.
+_QMT_INJECTED_GLOBAL_FUNCS = (
+    "passorder", "cancel", "get_trade_detail_data",
+) + _EXTRA_QMT_GLOBAL_FUNCS
+
+
+def capture_qmt_injected_funcs(namespace):
+    """Capture QMT-injected global funcs from a mounted entry's exec namespace.
+
+    QMT mounts an entry file by exec and injects these functions into THAT
+    namespace only -- the strategy module's globals/builtins lookups cannot
+    see them -- so a mounted entry must pass its own globals() here and feed
+    the result to bind_qmt_api(extra_funcs=...). Non-callables are skipped,
+    so a plain import namespace binds nothing.
+    """
+    captured = {}
+    for name in _QMT_INJECTED_GLOBAL_FUNCS:
+        func = (namespace or {}).get(name)
+        if callable(func):
+            captured[name] = func
+    return captured
+
 
 def _build_config():
     config = dict(_config)
@@ -662,6 +688,9 @@ def _build_rpc_service(context_info, app, config):
         settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
         order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
+        # .get(key) not .get(key, default): "" is a real answer here (leave
+        # 报单来源 blank), and a default would swallow it -- issue #154.
+        default_strategy_name=rpc_config.get("default_strategy_name"),
     )
     # Neither of these may depend on the TRANSPORT. Only a redis transport
     # builds the two clients above, so on zmq both were None -- and each had a
@@ -1365,6 +1394,24 @@ def handlebar(ContextInfo):
     return adjust(ContextInfo, _source="handlebar")
 
 
+# Redis is preferred for exec events, but only while it actually works.
+# "Configured" is not "reachable": redis-py builds a client lazily and does not
+# dial until the first command, so a stale redis block in the config yields a
+# perfectly good-looking client that times out on every publish -- and the zmq
+# push channel sitting right next to it never gets used (issue #145).
+_EXEC_REDIS_FAILURE_LIMIT = 3
+_exec_sink_state = {"redis_failures": 0, "reports": 0, "demoted": False}
+
+
+def _push_channel_sink():
+    if _quote_subscription_service is None:
+        return None
+    try:
+        return _quote_subscription_service[1]          # (manager, channel)
+    except Exception:
+        return None
+
+
 def _exec_event_sink(config):
     """Where exec events go: a Redis client, or the quote push channel.
 
@@ -1373,18 +1420,75 @@ def _exec_event_sink(config):
     simply returned (issue #76). zmq deployments already run a push channel for
     whole-quote data, so reuse it rather than opening a second socket.
 
-    Redis stays first when available: its channels carry streams for short
-    replay, which the push channel has no equivalent of.
+    Redis stays first *while it works*: its channels carry streams for short
+    replay, which the push channel has no equivalent of. After
+    _EXEC_REDIS_FAILURE_LIMIT consecutive publish failures it is demoted and
+    the push channel takes over, because an unreachable redis was otherwise
+    swallowing every callback while a working channel stood idle (issue #145).
     """
-    redis_client = _exec_event_redis(config)
-    if redis_client is not None:
-        return redis_client
-    if _quote_subscription_service is not None:
-        try:
-            return _quote_subscription_service[1]      # (manager, channel)
-        except Exception:
-            pass
-    return None
+    if not _exec_sink_state["demoted"]:
+        redis_client = _exec_event_redis(config)
+        if redis_client is not None:
+            return redis_client
+    return _push_channel_sink()
+
+
+def _note_exec_publish_failure(kind, exc):
+    """Count a failure, demote redis once it is clearly not coming back, and
+    keep the log readable.
+
+    The full traceback is deliberate -- issue #76 took a day because str(exc)
+    alone read "error return without exception set" with no origin. But a
+    persistently unreachable redis prints that for EVERY order and deal, which
+    buries the log it is meant to explain. Full detail the first few times,
+    a one-liner after that.
+    """
+    state = _exec_sink_state
+    state["redis_failures"] += 1
+    state["reports"] += 1
+    if state["reports"] <= 3:
+        _log_err(
+            "exec_events",
+            "publish %s failed: %s (%s)\n%s"
+            % (kind, exc, exc.__class__.__name__, _traceback.format_exc()),
+        )
+    elif state["reports"] % 50 == 0:
+        _log_err(
+            "exec_events",
+            "publish %s still failing after %d attempts: %s (%s)"
+            % (kind, state["reports"], exc, exc.__class__.__name__),
+        )
+    if not state["demoted"] and state["redis_failures"] >= _EXEC_REDIS_FAILURE_LIMIT:
+        state["demoted"] = bool(_push_channel_sink())
+        if state["demoted"]:
+            print("[bigqmt_exec_events] redis failed %d times in a row; switching "
+                  "to the quote push channel for order/trade callbacks. Remove the "
+                  "redis block from the local config to skip this entirely."
+                  % state["redis_failures"])
+
+
+def _publish_one(exec_events, sink, account_id, event, kind, config):
+    """Publish one event, falling back to the push channel if the sink fails.
+
+    Without the fallback a failed publish simply lost the callback -- the
+    client never learns the order happened. Trying the other channel costs one
+    extra attempt and only on the failure path.
+    """
+    try:
+        exec_events.publish_exec_event(sink, account_id, event)
+        _exec_sink_state["redis_failures"] = 0
+        return True
+    except Exception as exc:
+        _note_exec_publish_failure(kind, exc)
+    fallback = _push_channel_sink()
+    if fallback is None or fallback is sink:
+        return False
+    try:
+        exec_events.publish_exec_event(fallback, account_id, event)
+        return True
+    except Exception as exc:
+        _note_exec_publish_failure("%s (push fallback)" % kind, exc)
+        return False
 
 
 def _exec_event_redis(config):
@@ -1451,7 +1555,7 @@ def _publish_exec_event(kind, obj):
             event = exec_events.normalize_trade_event(obj, account_id)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_exec_event(sink, account_id, event)
+            _publish_one(exec_events, sink, account_id, event, kind, config)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
             # Identity enrichment reads the remark->identity map that
@@ -1463,7 +1567,7 @@ def _publish_exec_event(kind, obj):
                 event = exec_events.enrich_order_identity(redis_client, account_id, event)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_exec_event(sink, account_id, event)
+            _publish_one(exec_events, sink, account_id, event, kind, config)
             # 废单 (status=57 ENTRUST_STATUS_JUNK) 推送 order_error，让客户端
             # on_order_error 能感知下单被拒。
             try:
@@ -1474,14 +1578,16 @@ def _publish_exec_event(kind, obj):
                 err_event = exec_events.normalize_order_error_event(obj, account_id)
                 if raw_fields:
                     err_event["raw_fields"] = raw_fields
-                exec_events.publish_exec_event(sink, account_id, err_event)
+                _publish_one(exec_events, sink, account_id, err_event,
+                             "order_error", config)
     except Exception as exc:
-        # str(exc) alone reads "error return without exception set" with no hint
-        # of where it came from -- that is what made issue #76 take a day to
-        # pin down. Carry the exception class and the traceback.
+        # Publishing itself is handled (and throttled) inside _publish_one, so
+        # anything reaching here came from normalizing the QMT object. str(exc)
+        # alone reads "error return without exception set" with no hint of where
+        # it came from -- that is what made issue #76 take a day to pin down.
         _log_err(
             "exec_events",
-            "publish %s failed: %s (%s)\n%s"
+            "building the %s event failed: %s (%s)\n%s"
             % (kind, exc, exc.__class__.__name__, _traceback.format_exc()),
         )
 

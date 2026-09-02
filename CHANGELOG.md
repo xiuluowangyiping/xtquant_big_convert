@@ -2,6 +2,295 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+
+## [未发布]
+
+### 新增
+
+- **`rpc_default_strategy_name`：委托的「报单来源」由你决定**（issue #154，@kingtsi）：QMT 把委托的 投资备注 显示在 委托 列表的**报单来源**列里，所以那不是内部字段 —— 之前每一笔没指定策略名的委托都在那个界面上写着 `bigqmt_rpc`。
+
+  单次调用传 `strategy_name=` 一直是生效的，缺的是**默认值** —— `bigqmt_rpc` 硬编码在三处。现在可以在配置里设一次：
+
+  ```python
+  "rpc_default_strategy_name": "",     # 留空，和手动下单一样
+  ```
+
+  空字符串在整条链路上都当作**有效答案**（`.get(key)` 而不是 `.get(key, default)`），否则它会被默认值吞回去。默认不变，现有部署不受影响。**改配置需要重启策略** —— `bigqmt_signal_trader_strategy.py` 是顶层文件，`reload_deployment()` 刷不了。
+
+- **`describe_trade_detail_fields` 新增 `shape_fields`**：报告字段的**形状**而不是值 —— 长度、`|` 分段、以及字符类掩码（数字变 `#`、字母变 `a`、分隔符保留）。回答「这个字段里到底是什么东西」而不用把值送出 QMT。掩码是有损的，这正是重点：它带不回一个标识符。
+
+  #154 就是这么定的案：`m_strSource` 在本终端上是 `aaaaaa_aaaaa_aaaaaa` —— **只有字母和下划线，没有数字、没有 `-`、没有 `|`、没有 `{}`**，也就是策略名，不是 MAC 或设备 GUID。
+
+
+
+### 修复
+
+- **zmq 传输 + redis 可达的部署里，委托/成交回调永远收不到**（issue #144，@sumo225270）：服务端发布执行事件是「**redis 优先**」——只要能建出 redis 客户端就发 redis 通道（流带短回放），连挂多次才降级到 zmq 推送通道（#145）。而客户端 `_event_loop` 是**按 transport 选的**——zmq 传输只听 zmq 推送通道。于是这类部署里每个事件都发在 redis 上，客户端却在另一个通道上听：`on_stock_order` / `on_stock_trade` 静默全丢。
+
+  实盘复现（2026-09-02，国金 2.1.19.0，zmq 传输 + redis 可达）：当天全部委托事件都躺在 redis 流 `bigqmt:order_events:<账号>` 里（14:05 活单 50 → 撤单 54、16:40 废单 57 一条不缺），而 zmq 传输的 XtQuantTrader 回调一个都没收到。
+
+  修复：客户端监听**每轮重连时按服务端的规则重新选通道**——redis 可达（真 ping）订 redis 四通道，否则走推送通道；服务端中途降级 redis → 下一轮客户端跟着切。修复后实盘验证：客户端订上 `bigqmt:order_events:<账号>` 等四通道，按服务端同款格式注入一条合成委托事件，**1.0 秒后 `on_stock_order` 触发**，字段解析正确。回归测试 5 个（修复前 2 个失败），#76 的 zmq 推送通道用例全部保持。
+
+- **撤一个根本不存在的委托也报 `success=True`**（issue #151）：大 QMT 原生 `cancel` 的返回值描述的是「撤单请求有没有发出去」，不是「委托有没有被撤掉」—— 编造委托号（`bigqmt-probe-149-no-such-order` / `99999999999999`）在零可撤委托的账户上也返回成功。这是 #148 的镜像：原生返回**两个方向都不可信**。#149 只修了 falsey 一半，truthy 一半仍在快速路径上直接信。
+
+  现在两个方向都拿委托快照结算：truthy 先做一次**即时回读** —— 命中 53/54 立即确认（快速路径不多花一次往返）；查不到、状态仍在途中才挂起等结算。到期的语义也改了：委托**查不到**报失败（`was not found`），状态 **51/52（已报待撤/部成待撤）不再报「still status 51」失败** —— 那是交易所已受理、正在途中，报「cancel accepted, still in flight」。顺带修掉一类假阴性：truthy 但委托早已成交（56）/已废（57）现在正确报失败。
+
+  修复前 8 个新用例中 7 个失败；#148 既有用例全部保持。
+
+- **qmt-trader CLI 一批问题**（全部带回归测试，修复前 8 个用例失败）：
+
+  - **`cancel` 把撤单结果报反了**：网关遵循 MiniQMT 契约返回 `0`=成功 / `-1`=失败（issue #113），而 `bool(0)` 是 `False` —— 撤单**成功**被报成 `success: false`，**失败**反而报成 `true`。现在 `rc != 0` 直接以 `CANCEL_REJECTED` 报错退出；成功后回读委托行带回最终状态（写完必须回读）。
+  - **全局 flag 只能放在子命令前**：`qmt.py account --table` 报 `unrecognized arguments`，而这才是最自然的写法。现在 `--table`/`--account` 放在子命令后同样生效。
+  - **editable 安装下 `import xtquant` 被 site-packages 的真包遮蔽**：`_ensure_src_on_path` 只在 src 不在 sys.path 时才插入——editable 安装已把 src 放进去（但在 site-packages **之后**），于是真 xtquant 的 `__init__` 打印升级广告，污染 CLI stdout 上的 JSON 输出（`qmt.py ... | jq` 直接坏）。现在确保 src 永远挪到最前。
+  - **`quote-subscribe` 首帧竞态**：首帧快照可能在 `subscribe_whole_quote` 返回前就推给回调，此时 `sub_id` 尚未绑定，回调里 `unsubscribe_quote(sub_id)` 抛 `NameError`。加 None 守卫。
+  - **`kline` 统计的 high/low 名不副实**：用的是收盘价的最大/最小值，不是 K 线的最高/最低价。改用 high/low 字段（无字段时回落收盘价）。
+
+
+## [0.3.14] - 2026-09-02
+
+### 修复
+
+- **单文件构建丢掉了 zmq 绑定地址和 transport**（issue #153，@simonfantasy）：向导里填了 QMT 机器的局域网地址，生成的 `local_config.py` 里是对的 `"zmq": {"bind_address": "tcp://0.0.0.0:15618"}`，但跑起来的 FLAT 构建打印 `zmq started bound=tcp://127.0.0.1:15618`，跨机连不上。
+
+  报告人的判断是对的：**单文件部署从来不读 `local_config.py`** —— `_load_local_config()` 是拿构建文件顶部那个内嵌配置块**合成**出这个模块的。所以内嵌块**就是**配置，而生成它的 `render_single_file_config_block()` 少了两个 key：
+
+  ```
+  带 zmq 块 -> tcp://0.0.0.0:15618
+  无 zmq 块 -> tcp://127.0.0.1:15618      <- 报告里那行
+  ```
+
+  **还牵出一个没人报的**：内嵌块连 `transport` 都没有。no-redis 的 FLAT 构建之后会强制 zmq 所以躲过去了，但 base64 的 `single_file` 构建不强制 —— 在那里选 `transport=zmq`，生成出来的服务端跑 **redis** 而客户端说 zmq，正好复现成「客户端 transport 和服务端不匹配」的 ping 超时。
+
+  两个 key 都补上了。真正拦住这一类的是那条结构性测试：`render_server_config` 输出的每个顶层 key 都必须出现在单文件块里 —— 对单文件部署来说，配置**没有第二个来源**。
+
+  **注意**：修的是生成器，不是已生成的文件。升级后需要**重新跑一次 `bigqmt-init`** 生成单文件。
+
+- **qmt-trader CLI 的 `--dry-run` 会真下单**：`_ok()` 只打印不退出，dry-run 分支打印完预演后穿透到真实下单代码——`buy`/`sell`/`cancel` 三个命令全中招。SKILL.md 承诺「只打印不下单」，行为正好相反。2026-09-02 实盘事故：`buy 601398.SH 100 --dry-run` 真发出了一笔委托（仅因账户可用资金不足被打成废单，未造成成交）。补上两个 `return`，并加回归测试（修复前 4 个用例中 3 个失败）。
+
+
+## [0.3.13] - 2026-09-02
+
+### 修复
+
+- **已到券商的委托被报成 `-1`（拒单）**（issue #152，@willzhqiang）：同步下单返回 `-1`，客户端打出 `ORDER_REJECTED`，而按同一个 remark 立刻回查，委托**就在券商那里**：`order_sysid 635093411 / status 50 REPORTED / cancelable true / 冻结 421.72`。
+
+  报告人**没有重试**。如果重试了，就是重复下单 —— 这才是这个 bug 危险的地方，而不只是返回值不对。
+
+  窗口在于 QMT 会先放出委托行、稍后才填 `m_strOrderSysID`。`_apply_order_lookup` 匹配到 remark 就当结算完成，哪怕委托号还是空的：回复带着 `order_sys_id=None` 发出去，客户端把它变成 `-1`。
+
+  **委托行存在本身就证明委托已经到了券商**，所以现在的做法是继续等委托号，而不是不带委托号就作答。到期仍然没有委托号时，用能用的最响的方式说出来 —— 客户端遇到 `server_error` 会抛异常，所以它变成一个点名 remark 的异常，而不是一个静默的 `-1`：
+
+  ```
+  ORDER IS LIVE -- DO NOT RESUBMIT. passorder reached the broker and the
+  order row exists (...), but QMT had still not assigned order_sys_id after
+  N lookup(s) ... Find it by remark 'xxx' ... it is not a rejection.
+  ```
+
+  措辞刻意和隔壁那条「委托没进系统」区分开 —— 后者含义正相反（委托根本没到券商），而且开头就让人去查 QMT 的 `运行模式`（#122）。在这里说那句话会把人指到完全错误的方向。
+
+  **未实盘验证**：触发这个窗口需要真实下单，本仓库不下真单。修复前 10 个新测试里有 5 个失败。
+
+- **全推订阅把期货代码大写了，订阅从此不推**（issue #95，@lzxN / @frank0532）：`subscribe_whole_quote(["cu2610.SF"])` 只推一帧然后没了，而 `CF701.ZF` 每 250ms 一推。那一帧是订阅时的**首帧快照**（走 `get_full_tick`，保留大小写），它后面的周期订阅从来没工作过。
+
+  看着像交易所差异，其实是大小写：
+
+  ```
+  cu2610.SF   .upper() -> CU2610.SF    ← QMT 没有这个合约
+  CF701.ZF    .upper() -> CF701.ZF     ← 恰好不变，所以能用
+  ```
+
+  订阅管理器自己做了一次无条件 `.upper()`，**绕开了 `normalize_stock_code`** —— 后者从 #58 起就专门为 `.SF` / `.DF` / `.IF` / `.ZF` / `.INE` / `.GF` 保留调用方的原始大小写，正因为期货合约是小写的。所以「郑商所行、上期所不行」其实是「大写的行、小写的不行」。
+
+  现在分开处理：裸交易所令牌（`SH` / `sz` / `if`）仍然大写，带后缀的合约走 `normalize_stock_code`，解析不了的回落而不是让整个订阅崩掉。`cu2610.SF` 和 `CU2610.SF` 现在是两个订阅 —— QMT 只有其中一个，合并等于把错的字符串发给交易所。
+
+  **未实盘验证**：本终端无期货行情（`get_instrument_detail("IF2609.IF")` 返回 0 字段，报告人那台返回 33）。等 @lzxN 复测。
+
+- **板块写入 API：从静默空操作改成写完回读校验**（issue #143，由 #142 @DwayneZhang 引出）：`create_sector` 在大 QMT 上「能调、返回 None、什么都不做」—— 实测板块数量前后都是 13，调用方却以为建好了。这是最坏的一种失败。
+
+  先把三条通道枚举了一遍（`probe_capabilities` 新增 `sector_probe` 块，只读）：
+
+  | | 有什么 |
+  |---|---|
+  | `ContextInfo` | `create_sector`、`get_sector`、`get_stock_list_in_sector` |
+  | QMT 注入的全局函数 | **一个都没有** |
+  | 原生 xtdata SDK | `add_sector`、`remove_sector`、`get_sector_list` 等，但 `无法连接行情服务！` |
+
+  **这推翻了 issue #143 自己的说法**：`create_sector_folder` / `add_stock_to_sector` / `reset_sector_stock_list` / `remove_stock_from_sector` 不是「QMT 全局函数还没捕获」，它们在三条通道上都不存在。文档 §4.7 那个 `create_sector(parent_node, sector_name, overwrite)` 三参数签名同样不存在，所以签名保持 `(sector_name, stock_list)` —— 那才是真 SDK 给的形状，改成一个不存在的签名只是把一个错答案换成另一个。
+
+  现在：这一族按 `add_sector` 组合实现（`add_stock_to_sector` 用读-合并-写，所以底层是覆盖式还是追加式都对），**每次写入后回读校验**，没写进去就抛错并说明原因。宁可把一次成功的写入误报成失败，也不能再让调用方以为写进去了。`create_sector_folder` 三条通道都没有，直接抛 `NotImplementedError`。
+
+- **`get_sector_list` 不再用硬编码列表冒充真数据**（issue #143）：拿不到真实板块时它会返回 13 个常用板块名，和真列表**长得一模一样**，调用方分辨不出来，用户自建的板块永远不出现。我自己就是读了这个列表在 #130 给过一条错的建议。
+
+  现在拿不到就抛错，错误信息里写明原因和出路；想要那 13 个名字就显式传 `allow_fallback=True` —— 它们驱动 `get_stock_list_in_sector` 仍然有效（沪深A股 5217 只，实测）。**主动要是可以的，不问就塞给你不行。**
+
+- **回测结束时客户端超时，而不是被告知「结束了」**（issue #150，@chinapsu）：一次跑完的回测在最后抛 `TimeoutError: backtest ZMQ request timed out: next_bar`。
+
+  告知机制本来就有 —— 状态里带 `done`，`BacktestStrategy.run()` 见到就跳出循环再调 `finish()`。信号送不到，是因为 QMT 实际调用的那个入口顺序不对：
+
+  ```python
+  def stop(ContextInfo=None):
+      _RUNTIME.on_qmt_stop()      # 置 qmt_completed，唤醒等待者
+      _RUNTIME.stop_server()      # ……同时把 socket 拆了
+  ```
+
+  客户端要么正停在 `next_bar` 里（唤醒了，但回复还得走 ZMQ 回去，而 socket 正在关），要么两次调用之间（`next_bar` 发进一个已经没人的端口）。就算赢了这个竞争也只是把失败推后一步 —— `run()` 紧接着还要调 `finish()`。
+
+  `stop_server` 本身没错，它是 #109 的修复（端口留给了一个已经不存在的策略，下次跑起不来）。所以关闭流程现在两件事都做：**先把结局交给客户端，再释放端口** —— 和 `reload_deployment` 等响应队列排空再 `reset_app` 是同一个形状。等待有上限（默认 10 秒，`stop_grace_seconds` 可配），走掉的客户端不会把固定端口占死；从没连过客户端时完全不等，手动点停止不会平白多花 10 秒。
+
+  已有测试没盖到是因为它直接调 `session.on_qmt_stop()`，**从不走模块级 `stop()`** —— 这个 issue 讲的那段拆除逻辑根本不在测试里。
+
+- **撤单：原生返回为假时，改用委托状态确认**（issue #148，PR #149，@willzhqiang）：大 QMT 注入的 `cancel` 返回值描述的是「撤单请求有没有发出去」，不是撤单结果。@willzhqiang 的终端上实测到原生返回为假、但券商已受理且委托 67ms 内从状态 50 变成 54 —— 桥把一次成功的撤单报成了失败。
+
+  现在原生返回为假时不再直接当失败，而是把回复挂起，在 adjust 线程上按 `order_sys_id` 精确回读委托状态：53/54（部撤/已撤）报成功，56/57（已成/废单）、查询失败、委托查不到、超时仍活跃报失败。原生返回为真仍走原来的快速路径。
+
+  挂起复用 #44 那套 settlement 队列，不新起线程、不在 RPC 路径上 sleep —— `get_trade_detail_data` 在工作线程上返回空，所以状态回读只能在主线程做。
+
+  **尚未修完**：原生返回为真时仍然直接采信，而本仓库终端上实测**撤一个不存在的委托也返回真**（issue #151）—— 原生返回在两个方向上都不可信。状态 51/52（已报待撤、部成待撤）也还没有单独归类，目前会一路轮询到超时后报失败。
+
+- **大 QMT 期权 tick 快照与实时订阅兼容**：部分完整大 QMT 版本对显式
+  `.SHO/.SZO` 合约的 `ContextInfo.get_full_tick` 返回空，且
+  `subscribe_whole_quote` 不推送该合约。缺失的期权快照现在从
+  `get_market_data_ex(period="tick", count=1)` 补齐；显式期权订阅改用
+  `ContextInfo.subscribe_quote(..., result_type="list")`，并将列数组规范化为
+  最新一笔五档 tick。股票、ETF 和市场代码仍走原有共享全推路径；混合组合会
+  统一管理多个底层句柄，失败时回滚、退订时完整清理。
+
+  2026-09-02 盘中在完整大 QMT 2.1.19.0 实测：`10010974.SHO` 的
+  `get_full_tick` 从空结果恢复为实时五档；单期权订阅连续收到 500ms 推送；
+  `510050.SH + 10010974.SHO` 混合组合同时收到 ETF 与期权；510050 202609
+  期权链 IV/Greeks 仍为 28/28 有效。
+
+  另在本仓库的国金 2.1.19.0 终端上**独立复现并验证**：修复前
+  `get_full_tick(["10010974.SHO"])` 返回 `{}`，且混合请求
+  `["510050.SH", "10010974.SHO"]` **只回 510050 —— 期权静默消失**，调用方拿到
+  一个看起来正常的结果却少一个代码；修复后两者都返回 lastPrice / volume /
+  五档。订阅初始快照同样：修复前单期权那一帧一个代码都没有，修复后期权在。
+  连续推送未在本终端验证（测时为午休时段）。
+
+## [0.3.12] - 2026-09-02
+
+### 新增
+
+- **`redis_enabled` 开关：可以声明「这台机器没有 redis」**（issue #147）。以前声明不了 —— `configure_runtime` 无条件下发 redis 块，而 `REDIS_HOST` / `REDIS_PORT` 有默认值（`127.0.0.1:6379`），所以「配了 redis」和「什么都没写」从配置里分辨不出来。五个使用方各自的 `if not redis_config: return None` 守卫因此全是死代码。
+
+  ```python
+  BIGQMT_REDIS_CONFIG = {
+      "redis_enabled": False,     # 仅对非 redis 传输生效
+      "transport": "zmq",
+  }
+  ```
+
+  设 False 后整个 redis 块不再下发，委托身份库、异步下载任务、全推快照缓存、exec 事件推送**一次都不会去连**。`transport=redis` 时开关被忽略 —— 那种部署没 redis 就没有桥。
+
+  代价（例子配置里写明了，因为否则是静默的）：查询里的 `strategy_name` 回填失效（#133）；异步下载任务和全推快照缓存不可用 —— 后两个在大 QMT 上本来就默认关闭。**委托/成交回调不受影响**，走 zmq 推送通道。
+
+  `bigqmt_no_redis/DRYRUN_no_redis.py` 和单文件构建器现在默认带上这一项 —— 最确定会撞上这个问题的构建，恰恰是最没法表达它的。
+
+### 修复
+
+- **连不上的 redis 会吞掉委托/成交回调**（issue #145，@heimo88）：`_exec_event_sink` 只要 redis「available」就优先，而 available 只意味着**配了**。redis-py 是惰性连接的，配了但连不上时 client 建得出来、每次 publish 才超时 —— **回调全丢，而旁边工作正常的 zmq 推送通道一次都没被用上**，每个事件还刷一整段 traceback。
+
+  现在：publish 失败**立刻回落到推送通道**（回调照样送达，不再丢）；连续 3 次失败降级 redis，且**只在有地方可降时才降**（降到 None 等于把吵闹的失败变成静默的失败）；traceback 限流 —— 前 3 次全量（issue #76 挣来的），之后每 50 次一行摘要。
+
+- **两个桥接器抢同一个日志文件**（issue #144，@sumo225270）：同机同账号跑实盘桥 + 模拟桥，两个客户端都回落到 `~/.cache/bigqmt/logs/bigqmt.log`。两个进程两个句柄，Windows 永远拒绝轮转重命名，而轮转不成功意味着 `backupCount` 清理也永不执行 —— 日志无限增长。
+
+  0.3.11 的 #139 修的是**同一进程内** handler 累积；这条是**跨进程**，进程内怎么管都够不着。日志文件名现在带进程标识：有 `BIGQMT_ACCOUNT_ID` 就用账号（跨重启稳定，轮转能接上），否则用 PID，`BIGQMT_LOG_NAME` 可以钉死。轮转失败也不再抛 —— 丢一次轮转比每写一条日志刷一段 traceback 好。
+
+  实盘：部署后日志目录里是 `bigqmt-pid51044.log` / `bigqmt-pid76544.log` / `bigqmt-pid88484.log`，每条日志只出现 1 次；`bigqmt.log.2026-09-01` 出现了 —— **这个部署有史以来第一次轮转成功**。面板轮转报错从部署前 7 次变为部署后 0 次。
+
+### 已知限制
+
+- **#145 的失败降级路径未经实盘验证**：本机 redis 是通的，走不到那条分支。只有单元测试覆盖（16 个用例）。要实盘验证得停掉 redis 再下单，两件都没做。
+- **`redis_enabled=False` 的效果未经实盘验证**：本机有 redis，不需要关。默认值（True）的**无回归**已验证 —— redis 块照常下发、exec 事件仍选 redis、委托身份库端到端跑通。
+
+## [0.3.11] - 2026-09-01
+
+### 修复
+
+- **失败的 QMT 登录被报成启动成功**（PR #141，@willzhqiang）：FormulaServer 的 58600 端口**在登录框还开着的时候就已经在监听**。`open_qmt()` 提交凭据后立刻用这个端口判就绪，于是券商拒绝或超时的登录会被当成终端启动成功 —— 而桥根本没挂上。
+
+  实盘复现（#140 合并后做负向路径验证时发现）：账号密码正确填入并提交、**58600 在监听**、登录框仍在、QMT 报 `200003 超时`，`XtClient` 日志里 `CProxyClient::onLogin ... status = 21`、`slot_onLoginStatus ... 错误200003,超时`。旧的就绪检查立刻返回成功。
+
+  现在提交凭据后要等窗口从登录框形状过渡到主界面形状才算登录完成；登录框不消失则超时并抛出具体的 `QmtLauncherError`。端口就绪退回成后续的进程健康检查，不再能替代「登录完成」。
+
+### 已知限制
+
+- **非最大化的主界面会让成功的登录被判失败**：窗口识别用的是比例判据（<65%，见 0.3.10 的 #140），主界面如果没最大化（如 1100x700 / 1920x1200 = 0.57x0.58）会一直被当成登录框，登录成功也会抛 `QmtLauncherError`，阻断无人值守重启。
+
+  仍然合入的理由：**修复前是「登录失败被静默报成成功」，修复后最坏是「成功被报成失败」** —— 后者声音大、消息里写明原因，前者看不见。响的失败胜过静默的错误。
+
+  后续改进方向：判据改成相对的（拿提交前的登录窗 handle/rect 做基准，变了即成功），不依赖主界面的绝对比例。
+
+## [0.3.10] - 2026-09-01
+
+### 修复
+
+- **QMT 自动登录在 DPI 缩放下点错位置**（PR #140，@willzhqiang）：**这条解释了 0.3.8 里记的那次实盘事故** —— 「账号框坐标原本打在右侧下拉箭头上，导致密码被追加进账号框」。当时挪了坐标、加了字段级像素验证，但**没找到坐标为什么会偏**。
+
+  原因：`pyautogui` 在 import 时会开启进程 DPI 感知。**先量窗口、后 import pyautogui** 的话，`GetWindowRect` 返回逻辑坐标而 `SetCursorPos` 吃物理坐标 —— 150% 缩放下一次「安全的账号框点击」会落到几百像素之外。现在在第一次枚举窗口之前就调 `SetProcessDPIAware()`。
+
+  登录窗识别也从绝对像素阈值（`<800 且 <600`）改成比例判据：同一个国金登录窗，DPI 虚拟化下报 832x591、DPI 感知后报 1248x886，而屏幕尺寸同步放大，**比例对缩放不变**。
+
+  已知边界：非最大化的主界面（如 1100x700 / 1920x1200 = 0.57x0.58）会被误判成登录框，旧的绝对阈值在这里反而安全。真正的防线是其后的字段级像素验证 —— 打字落到错误字段会清空泄露并中止、绝不提交，所以最坏是一次失败的登录尝试。
+
+### 新增
+
+- **本地期权 IV 与希腊字母**（PR #138，@willzhqiang）：部分大 QMT 环境的 `get_option_iv` 恒返回 `0.0` 且没有希腊字母接口。新增**零依赖**的 Black-Scholes-Merton 定价、有界二分求解隐含波动率、以及 Delta/Gamma/Vega/Theta/Rho。
+
+  - `xtdata.get_option_analytics(code)` 单合约；`xtdata.get_option_chain_analytics(code, expiry)` 整条链（一次批量取收盘价）
+  - **单位显式暴露**：`vega_1pct` / `theta_per_day` / `rho_1pct` 与原始值并列 —— 不同库在这里的口径几乎总是不一样（除不除 100、除 365 还是 252），而单位错了的结果看起来完全正常
+  - 无套利边界校验；坏合约保留 `analytics_error` 而不是毒化或中断整条链
+  - 命令行 `qmt-trader option-greeks`
+  - **纯客户端**：不改 RPC 白名单、不动原生 `get_option_iv` 语义，并有 AST 扫描的不变式测试保证服务端模块不会 import 它
+
+  数学独立核对过（不看 PR 自带的测试，按公式另写一份参考实现）：价格与希腊字母**逐项 0.00e+00**，与 Hull 教科书公布值一致（call 4.759 / put 0.808）；隐含波动率往返在 0.05–3.0 区间误差 ~1e-12。边界（T=0 / sigma=0 / 价格越界）全部显式抛错并带上实际边界值。
+
+- **`qmt-trader` CLI 不再被旧部署包遮蔽**（PR #138）：QMT 目录常带一份同名的旧包，原来它被 `sys.path.insert(0)` 放在最前，新的 CLI 命令会在那份旧代码上执行。改成 `append` —— 仍能发现 `local_config.py`，但不再盖住选定的包。
+
+### 已知限制
+
+- **期权解析部分本机复核不了实盘**：本机账户无期权权限。数学、边界、接口设计和 import 边界都逐项验过，但「在真实期权链上跑出来的数字」只有贡献者的记录：`10010975.SHO`（到期 20260923）、2026-09-01 21:11、标的 3.055、期权 0.0198、本地 IV 0.1236642706、原生 `get_option_iv` 0.0、重定价误差 1.3e-11；同次 510050 202609 链 28/28 成功。
+- **DPI 登录修复由贡献者实盘验证**：本机未做真实自动登录测试（会动到实盘终端的登录流程）。贡献者在自己机器上做了两次真实 QMT 自动登录重启。
+
+## [0.3.9] - 2026-09-01
+
+### 新增
+
+- **期货 / ETF 期权 opType 直通**（PR #131，close #129）：期货把「开/平、今/昨」编码在 opType 里，ETF 期权还多一个「备兑」。以前映射回 BUY/SELL 再重拼 opType 会丢掉这些 —— **平今多会变成普通卖出**，和 #103 里融资买入变普通买入同一类错误。现在 0-15（期货/股指期权/商品期权）和 50-59（ETF 期权）原样透传。
+
+  每个值都对着官方枚举逐个核过（`docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md` 10.1）：平昨空(4)/平今空(5)/平空(8,9) 归 BUY，平昨多(1)/平今多(2)/平多(6,7) 归 SELL；备兑开仓(54) 是 SELL、备兑平仓(55) 是 BUY；56-59（行权/锁定/解锁）没有方向，要求显式传 `action`。16-22 官方未定义，不收；ETF 期权起于 50 不是 48（48/49 属组合交易）。
+
+  **股票账号收到期货 opType 直接抛错，不回落到 23/24** —— 回落会发出一笔品种和方向都不对的真实股票单。
+
+### 修复
+
+- **`bigqmt-init` 生成的 ZMQ 客户端从来连不上**（PR #137，close #136，@willzhqiang）：向导和传输层各算各的端口 —— `15000 + n%1000` vs `15560 + n%100`。两者要相等得满足 `(n%1000)-(n%100) == 560`，而这个差恒为 100 的倍数，**560 不在里面**。暴力验证 0..99999：**0 个账号能对上**。而症状只是一个干巴巴的超时。
+
+  host 也是错的：连接地址用的是 **Redis 的 host**，而服务端默认只绑 loopback、且向导写的服务端配置里根本没有 zmq 段。现在两边由同一个 `_default_zmq_address` 派生，服务端配置写 `bind_address`（同机 loopback / 跨机 0.0.0.0 并提示防火墙），向导也改问「QMT 终端地址」。
+
+  实盘对上了：运行中的桥绑 `tcp://127.0.0.1:15563`，向导现在生成的正是这个（修复前会生成 15503）。
+
+- **QMT 注入函数在直挂形态下不可见**（PR #134，@cnwuwil）：QMT 以 exec 挂载策略文件，`passorder` / `download_history_data` 等**只注入挂载文件的命名空间**，strategy 侧的 globals/builtins 查找看不见 —— 所有交易/下载/查询 RPC 静默失效。runtime 直挂时改为自捕获，名单收敛到 strategy 单一事实源（`_QMT_INJECTED_GLOBAL_FUNCS`）+ 三重防漂移测试。壳形态（BIGQMT_REDIS_DRYRUN）零变化，两个方向都有测试钉住。
+
+- **none 复权读缺股不自愈**（PR #134）：大 QMT 的 raw store 非全市场铺满（实测 5225 只请求只回 8 只）。附带修掉一个更隐蔽的：`get_market_data` 返回的是 **field 键形状**（`{field: {code: [..]}}`），原实现在顶层找 code，**所有代码永远「缺失」**。判据收敛为「过半缺失才自愈」，少数常驻无数据代码（退市/停牌/无权限）不再让每次读都付下载 + 重读成本。
+
+- **cache 禁用时下载失败仍报满进度**（PR #134）：服务端下载 RPC 被 `except: pass` 吞掉后照样返回 `{finished: total}` —— 正是 #47 定义过的假进度。禁用分支（无拉取可兜底）改为直接抛。
+
+- **日志 handler 每次重启/reload 累积一个**（issue #139）：同一条日志被写进 `bigqmt.log` **16 遍**，QMT 面板里单实例出现 373 次。
+
+  幂等的依据放在模块级 `_initialized` 上，而入口每次启动都 `_clear_local_modules()`（`reload_deployment()` 同样 purge）—— 模块状态归零，而 `logging.getLogger("bigqmt")` 活在 logging 的全局注册表里、活得过。**模块重置、logger 不重置，于是每启动一次就多两个 handler。**
+
+  后果三个，一个比一个隐蔽：日志膨胀 16 倍淹掉真错误；16 个句柄占同一个文件让轮转必然 `WinError 32`（每写一条日志抛一次）；轮转从不成功导致 `backupCount` 清理永不执行、`BIGQMT_LOG_RETENTION_DAYS` 形同虚设。
+
+  修法是把幂等依据挪到 logger 自己，并且 `removeHandler` **必须配 `handler.close()`** —— 只摘不关，文件句柄还在。
+
+### 已知限制
+
+- **期货 / 期权下单路径未经实盘验证**：本机账户无期货和期权权限，PR #131 的下单链路只有单元测试覆盖。透传守卫（股票账号收到期货 opType 抛错）同理未实盘触发。
+- **直挂形态由贡献者验证，非本机**：PR #134 的核心主张（注入函数自捕获）由 @cnwuwil 在自己的模拟端验证（`probe_capabilities`、`get_ipo_data` 返回真实数据）；本机跑的是 DRYRUN 壳形态，只验了壳形态无回归。
+- **none 复权自愈在部分终端够不着**：判据按「代码是否在返回的 key 里」判，而本机终端**给每个请求的代码都返回 key、无数据时给空帧**，因此 `missing` 恒为 0、自愈永不触发（没好处也没坏处）。贡献者的终端是真的省略 key，所以在那边工作。按行数判可同时覆盖两种，留作后续改进。
+- **日志轮转恢复是推断，非实测**：句柄数从 16 降到 1 消除了 `WinError 32` 的成因，但轮转在午夜发生，本次未观察到成功轮转。
+
 ## [0.3.8] - 2026-09-01
 
 ### 新增
@@ -739,7 +1028,7 @@ xt_trader.sync_deployment()   # 自动拷，不碰 config 文件
 
 ---
 
-## [Unreleased]
+## [0.2.7] - 2026-08-24
 
 ### 新增
 
