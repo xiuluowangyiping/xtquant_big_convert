@@ -7,6 +7,7 @@ callback thread.
 """
 
 import base64
+import collections
 import datetime as _dt
 import json
 import math
@@ -33,6 +34,7 @@ READ_METHODS = {
     "ping",
     "get_deployment_info",
     "probe_capabilities",
+    "probe_order_identity",
     "get_ticks",
     "get_instrument",
     "get_instrument_type",
@@ -50,6 +52,7 @@ READ_METHODS = {
     "get_trading_dates",
     "get_holidays",
     "download_holiday_data",
+    "download_his_st_data",
     "get_ipo_info",
     "get_etf_info",
     "download_etf_info",
@@ -135,6 +138,7 @@ LISTENER_DEFERRED_METHODS = {
     "query_stock_position",
     "query_orders",
     "query_trades",
+    "query_execution_snapshot",
     "describe_trade_detail_fields",
     "reload_deployment",
     "query_account_infos",
@@ -220,6 +224,7 @@ MARKET_DATA_METHODS = {
     "get_trading_dates",
     "get_holidays",
     "download_holiday_data",
+    "download_his_st_data",
     "get_ipo_info",
     "get_etf_info",
     "download_etf_info",
@@ -520,6 +525,13 @@ class BigQmtRpcHandlers:
         # 融资融券查询等)。由 strategy._build_config 解析注入。
         self.qmt_api = dict(qmt_api or {})
         self._submit_journal = {}
+        # In-process order-identity journal: remark -> strategy_name, written
+        # at submit time and read back at query time. The Redis identity store
+        # covers restarts and other processes; this covers deployments with no
+        # Redis at all (zmq single-file), where attribution used to silently
+        # read "" forever (issue #156 follow-up to #133). Bounded FIFO,
+        # same 24h TTL as the Redis store.
+        self._order_identity_local = collections.OrderedDict()
         # Order settlement. Async by default: blocking here holds the QMT main
         # strategy thread, which serializes every other request behind it and
         # caps throughput at ~2 orders/sec (issue #44).
@@ -1047,22 +1059,58 @@ class BigQmtRpcHandlers:
         if not unnamed:
             return rows
         redis_client = self._identity_redis()
-        if redis_client is None:
-            return rows
-        try:
-            from .exec_events import order_identity_map
+        if redis_client is not None:
+            try:
+                from .exec_events import order_identity_map
 
-            identities = order_identity_map(
-                redis_client, account_id,
-                [getattr(row, "user_order_id", "") for row in unnamed])
-        except Exception:
-            return rows
-        for row in unnamed:
-            identity = identities.get(
-                str(getattr(row, "user_order_id", "") or "").strip())
-            if identity and identity.get("strategy_name"):
-                row.strategy_name = str(identity.get("strategy_name") or "")
+                identities = order_identity_map(
+                    redis_client, account_id,
+                    [getattr(row, "user_order_id", "") for row in unnamed])
+                for row in unnamed:
+                    identity = identities.get(
+                        str(getattr(row, "user_order_id", "") or "").strip())
+                    if identity and identity.get("strategy_name"):
+                        row.strategy_name = str(identity.get("strategy_name") or "")
+            except Exception:
+                pass
+        # No-Redis deployments still name what THIS process submitted: the
+        # in-process journal written at submit time (issue #156).
+        journal = getattr(self, "_order_identity_local", None)
+        if journal:
+            now = time.time()
+            for row in unnamed:
+                if str(getattr(row, "strategy_name", "") or "").strip():
+                    continue
+                key = (str(account_id or ""),
+                       str(getattr(row, "user_order_id", "") or "").strip())
+                entry = journal.get(key)
+                if not entry:
+                    continue
+                ts, name = entry
+                if name and now - ts <= self._ORDER_IDENTITY_LOCAL_TTL_SECONDS:
+                    row.strategy_name = name
         return rows
+
+    _ORDER_IDENTITY_LOCAL_LIMIT = 5000
+    _ORDER_IDENTITY_LOCAL_TTL_SECONDS = 86400.0
+
+    def _remember_order_identity_local(self, account_id, remark, strategy_name):
+        remark = str(remark or "").strip()
+        if not remark:
+            return
+        key = (str(account_id or ""), remark)
+        try:
+            journal = getattr(self, "_order_identity_local", None)
+            if journal is None:
+                # Tests (and the QMT sandbox) build handlers via __new__ and
+                # skip __init__ -- create on first use.
+                journal = self._order_identity_local = collections.OrderedDict()
+            journal[key] = (time.time(), str(strategy_name or ""))
+            journal.move_to_end(key)
+            while len(journal) > self._ORDER_IDENTITY_LOCAL_LIMIT:
+                journal.popitem(last=False)
+        except Exception:
+            pass
 
     def _handle_describe_trade_detail_fields(self, params):
         """Report which attributes QMT's ORDER / DEAL rows carry. Names only.
@@ -1402,6 +1450,69 @@ class BigQmtRpcHandlers:
         except (NotImplementedError, AttributeError):
             return False
 
+    def _handle_probe_order_identity(self, params):
+        """Diagnose the strategy_name backfill chain, one link at a time.
+
+        #156's reporter: the identity record exists in Redis, the key matches,
+        and the query still reads strategy_name="". Nothing along the chain
+        can say which link dropped it from the outside -- this answers that
+        from the inside: is the identity Redis wired at all, does the key
+        exist under THIS account, is the local journal covering it (#156's
+        in-process fallback), and does the raw lookup raise.
+        """
+        account_id = self._request_account_id(params)
+        remark = str(params.get("remark") or params.get("user_order_id") or "").strip()
+        redis_client = self._identity_redis()
+        journal = getattr(self, "_order_identity_local", None) or {}
+        out = {
+            "account_id": account_id,
+            "remark": remark,
+            "identity_redis_wired": redis_client is not None,
+            "local_journal_size": len(journal),
+        }
+        if not remark:
+            out["note"] = "pass remark=<the order's remark> to check the key"
+            return out
+        from .exec_events import order_identity_key
+
+        key = order_identity_key(account_id, remark)
+        out["identity_key"] = key
+        if redis_client is not None:
+            try:
+                out["redis_hit"] = bool(redis_client.get(key))
+            except Exception as exc:
+                out["redis_hit"] = None
+                out["lookup_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        entry = journal.get((account_id, remark))
+        out["local_hit"] = bool(entry and entry[1])
+        if entry:
+            out["local_strategy_name"] = entry[1]
+        return out
+
+    def _handle_download_holiday_data(self, params):
+        # MiniQMT downloads a holiday table from the xtdata service. Big QMT's
+        # terminal maintains the trading calendar itself (refreshed at login
+        # and by its own data updater), so there is nothing to download and no
+        # ContextInfo method to call -- the old generic path answered with
+        # NotImplementedError (issue #163). A clear no-op instead.
+        return {
+            "ok": True,
+            "downloaded": False,
+            "note": ("Big QMT maintains the trading calendar itself; nothing "
+                     "to download. get_trading_dates/get_holidays read the "
+                     "terminal's own data."),
+        }
+
+    def _handle_download_his_st_data(self, params):
+        # Same shape as download_holiday_data: ST history lives in the
+        # terminal's own data on Big QMT (issue #163).
+        return {
+            "ok": True,
+            "downloaded": False,
+            "note": ("Big QMT maintains ST history in the terminal's own data; "
+                     "nothing to download. get_his_st_data reads it directly."),
+        }
+
     def _order_action_from_params(self, params):
         action = str(params.get("action") or "").upper()
         if action:
@@ -1518,6 +1629,10 @@ class BigQmtRpcHandlers:
             )
         except Exception:
             pass
+        # Always journal locally too -- cheap, and the only attribution a
+        # no-Redis deployment has (issue #156).
+        self._remember_order_identity_local(
+            request.account_id, request.remark, request.strategy_name)
 
         result = self.order_gateway.submit(request)
 
@@ -1572,6 +1687,20 @@ class BigQmtRpcHandlers:
         """
         request = settlement.order_request
         settlement.attempts += 1
+        # Fast path: QMT's order_callback already pushed the answer
+        # (issue #164). A miss means nothing -- fall through to the poll.
+        watch = getattr(self, "order_watch_table", None)
+        if watch is not None:
+            try:
+                watched_sysid = watch.sysid_for_remark(request.remark)
+            except Exception:
+                watched_sysid = None
+            if watched_sysid:
+                try:
+                    settlement.result.order_sys_id = watched_sysid
+                except Exception:
+                    pass
+                return True
         try:
             orders = self.order_gateway.query_orders(request.account_id, "") or []
             by_remark = [
@@ -1800,41 +1929,8 @@ class BigQmtRpcHandlers:
             self._pending_settlement = settlement
         return result
 
-    def _apply_cancel_lookup(self, settlement, final=False):
-        """Resolve an ambiguous native cancel return from the order snapshot."""
-        settlement.attempts += 1
-        order_sys_id = str(settlement.order_ref.order_sys_id or "")
-        try:
-            strict_query = getattr(self.order_gateway, "query_orders_strict", None)
-            if callable(strict_query):
-                orders = strict_query(settlement.account_id, "") or []
-            else:
-                orders = self.order_gateway.query_orders(settlement.account_id, "") or []
-        except Exception as exc:
-            if not final:
-                return False
-            settlement.result.success = False
-            settlement.result.message = (
-                "cancel status lookup failed after %d attempt(s): %s: %s"
-                % (settlement.attempts, exc.__class__.__name__, exc)
-            )
-            return True
-
-        matches = [
-            order for order in orders
-            if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
-        ]
-        if not matches:
-            if not final:
-                return False
-            settlement.result.success = False
-            settlement.result.message = (
-                "cancel was not confirmed: order %s was not found after %d lookup(s)"
-                % (order_sys_id, settlement.attempts)
-            )
-            return True
-
-        status = str(getattr(matches[0], "status", "") or "")
+    def _settle_cancel_from_status(self, settlement, status, order_sys_id, final):
+        """One status answer, from the watch table or the snapshot row."""
         if status in CANCELED_ORDER_STATUSES:
             settlement.result.success = True
             settlement.result.message = ""
@@ -1868,6 +1964,55 @@ class BigQmtRpcHandlers:
             % (settlement.attempts, order_sys_id, status or "unknown")
         )
         return True
+
+    def _apply_cancel_lookup(self, settlement, final=False):
+        """Resolve an ambiguous native cancel return from the order snapshot."""
+        settlement.attempts += 1
+        order_sys_id = str(settlement.order_ref.order_sys_id or "")
+        # Fast path: the order's own status change was pushed to us by QMT's
+        # order_callback (issue #164). A table miss falls through to the poll.
+        watch = getattr(self, "order_watch_table", None)
+        if watch is not None:
+            try:
+                watched = watch.status_for_sysid(order_sys_id)
+            except Exception:
+                watched = None
+            if watched is not None:
+                return self._settle_cancel_from_status(
+                    settlement, str(watched), order_sys_id, final)
+        try:
+            strict_query = getattr(self.order_gateway, "query_orders_strict", None)
+            if callable(strict_query):
+                orders = strict_query(settlement.account_id, "") or []
+            else:
+                orders = self.order_gateway.query_orders(settlement.account_id, "") or []
+        except Exception as exc:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel status lookup failed after %d attempt(s): %s: %s"
+                % (settlement.attempts, exc.__class__.__name__, exc)
+            )
+            return True
+
+        matches = [
+            order for order in orders
+            if str(getattr(order, "order_sys_id", "") or "") == order_sys_id
+        ]
+        if not matches:
+            if not final:
+                return False
+            settlement.result.success = False
+            settlement.result.message = (
+                "cancel was not confirmed: order %s was not found after %d lookup(s)"
+                % (order_sys_id, settlement.attempts)
+            )
+            return True
+
+        status = str(getattr(matches[0], "status", "") or "")
+        return self._settle_cancel_from_status(
+            settlement, status, order_sys_id, final)
 
 
 def _bool_value(value, default=False):

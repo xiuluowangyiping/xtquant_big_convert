@@ -1,9 +1,58 @@
 # Changelog
 
+
+## [未发布]
+
+### 修复
+
+- **结算不再盲轮询：回调把委托号/状态推给我们了**（issue #164）：下单/撤单结算原来在 adjust 主线程上一轮一轮 `query_orders`（实测一次撤单 3.6s 打了 135 轮）。新增回调喂养的 `OrderWatchTable`（remark→委托号、委托号→状态，有界 FIFO + 24h TTL，C++ 回调线程写、adjust 线程读，普通 dict+锁）：结算先查表，命中即结算、零轮询；查不到回落原有轮询（模拟模式没有回调，轮询保留为兜底）。单测 11 个（含两条快路径零查询、回退路径、表语义/TTL/有界）。**生效需重启策略**（改了顶层 strategy 文件）。
+
+
+- **按 strategy_name 过滤查委托，返回的行却 strategy_name=''**（issue #156 跟进，@kingtsi）：过滤本身有效（QMT 按策略名过滤返回 15 条），但委托行构建缺成交行早就有的「过滤兜底」——给了过滤器时，每行按构造就属于它。补上。实盘验证：`query_stock_orders(strategy_name='TEST')` 返回 2 条且 `strategy_name='TEST'`。另外新增诊断 RPC `probe_order_identity`（传 remark 返回身份链每环状态：redis 是否接线/key 名/redis 命中/进程内兜底命中），「策略名读不回」类问题以后一条调用就能定位断在哪环。
+
+
+- **`download_holiday_data` / `download_his_st_data` 在大 QMT 上抛 NotImplementedError**（issue #163，@Randall-Chan）：MiniQMT 这两个是从 xtdata 服务下载假日表/ST 历史；大 QMT 终端自己维护这些数据（登录/数据更新时刷新），没有要下载的东西。现在明确回答 no-op + 说明（之前走通用兜底报 NotImplementedError，用户只能注销那两行）。实盘验证：两个调用都返回 `ok: True, downloaded: False` + 说明。客户端补上漏掉的 `download_his_st_data` 方法。
+
+- **redis < 5.0 没有 streams，每个 tick 都在抛 `unknown command 'XADD'`**（issue #163）：事件回放流和持仓事件流都要 XADD，Windows 上常见的老 redis（3.0.x）没有这命令。现在第一次失败就学到并永久跳过 xadd（日志只说一次），pub/sub 回调不受影响（老 redis 上实时回调一直是通的）；升 redis ≥ 5.0 回放自动恢复。瞬时故障不会误触发。回归测试 6 个（修复前全失败）。
+
+
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.17] - 2026-09-03
+
+### 修复
+
+- **一笔委托触发两次「已报」回调，第一次还是残缺事件**（issue #161，@sumo225270）：QMT 在委托行出现时和 `m_strOrderSysID` 填上后各触发一次 order_callback（#152 的同一窗口），客户端于是看到两条一样的「已报」，第一条无委托号（order_id=0）。现在无委托号的委托事件**扣留 0.8 秒**：带号孪生到达即丢弃（只发一次完整事件），没来则由 adjust 循环补发（不丢事件）。扣留窗口可用 `exec_events_hold_presysid_seconds` 配置，设 0 恢复旧行为。实盘验证（国金 2.1.19.0）：废单路径从「50 无号 + 57 带号」两条变 1 条完整事件。**已报-已报的去重形状需开盘时段复验**（当前已过收盘，只能走废单路径）。
+
+- **回调事件缺 `instrument_name`**（issue #161）：事件规范化没带这个字段。现在 QMT 对象自带就用自带的，没有则服务端用 ContextInfo 查一次并缓存（同一代码只查一次），委托/成交事件都带上。客户端 `order.instrument_name` / `trade.instrument_name` 直接可用。实盘验证：`name='工商银行'` ✓。
+
+  顺带说明报告人的第三问：**QMT 界面手动下的单 strategy_name 永远为空**——手动单没有 remark，身份库无从关联，而 QMT 委托/成交行本身不携带策略名（#133）。KPI 分析建议按「remark 为空」归入手动桶。
+
+### 新增
+
+- **`deploy/` 一键 Windows 部署包**（PR #158，@karlthas007）：`deploy_qmt_bridge.ps1` 在全新 Windows 机器上一次完成——客户端环境（miniconda py3.13 或系统 python venv，pip/conda/Miniconda 默认清华镜像可切官方源）、服务端 4 项拷入 QMT、redis 5.0.14 注册为 Windows 服务（127.0.0.1 + 随机密码 + 192mb noeviction）、生成双侧配置；幂等可重跑，`-CheckOnly` 只读检查。附 `qmt_cli.py`（ping/资产/持仓/委托/成交/tick/kline/买卖/撤单/watch）。作者在江海证券大 QMT 实盘验证过全链路。**合并修正**：帮助文本里的示例账号改为占位符；生成的服务端配置默认 `rpc_allow_order_methods=False`（下单是显式人工决定，加 `-AllowOrders` 才开），与仓库安全默认一致；qmt_cli.py 缺配置时给明确指引而不是 ImportError。
+- **`contracts.py` 兼容无 typing_extensions 的 py3.6**（PR #159，@karlthas007）：`typing.Protocol`（3.8+）缺失时先退 typing_extensions，再退纯占位基类——QMT 内嵌 python36 没有这两个库。该模块当前无调用方（latent），此修复保住全 src 的 py3.6 可导入性。补了模拟 py3.6 环境的回归测试。
+
+### 修复
+
+- **`get_trading_dates` 每次调用都白烧 2 秒**（issue #160，@heimo88）：他看到的是策略启动后第一次 21.6s（SDK 冷初始化），我们实盘实测发现**每次调用都 ~2.1s**——`_native_or_context` 每个调用都先让原生 xtdata SDK 去拨它在大 QMT 里永远连不上的行情服务，超时报错后才回落 ContextInfo。而「SDK 在、行情服务不在」在大 QMT 进程里是**不会自愈的永久状态**。现在原生失败按函数名记住 600 秒，窗口内直接走 ContextInfo（成功一次即清除标记）；全部 15 个 `_native_or_context` 调用点受益（`get_holidays` 等含）。回归测试 5 个（修复前 4 个失败）。**生效需同步 QMT 端并重启策略**。**已实盘验证（0.3.16 + 本条部署后）**：reload 后首次 2.5s（最后一次 SDK 实拨），之后每次 **30-46ms**。
+
+- **`xt_trader.sync_deployment()` 从来是坏的**：它调 `self.get_deployment_info()`，而该方法只在 `BigQmtXtData` 上——trader 路径一调就 AttributeError（在部署 #160 时踩到）。改为直接走 `self.client.call("get_deployment_info")`。回归测试 2 个（修复前均失败）。
+
+
+## [0.3.16] - 2026-09-03
+
+### 修复
+
+- **`order_stock_async` 排了队没发出去的委托随进程退出静默丢失**（issue #156，@kingtsi）：循环连发 async 下单后脚本立即退出——worker 是 daemon 线程，主线程一结束它就被掐死，队列里剩下的委托一笔都不发、没有任何报错；他的 sleep 只是在给进程续命。实盘复现（工行 100 股 ×3 深价单）：立即退出 3 笔只到 1 笔，`wait_async_orders()` + 宽限 3/3。
+
+  修复：`stop()` 和 atexit 钩子（首次 async 下单时注册）在退出前**排干队列**——等 worker 发完已排队的每一笔（有界 5s），再给在途响应 3s 宽限让 `on_order_stock_async_response` 触发。空队列零开销；全程不抛异常。修复后按报告人形态实测：立即退出也 3/3 到达且回调齐全。注意回调本身仍要求进程存活——要在脚本里看回调，得让进程活到回调到达（或显式 `wait_async_orders()`）。
+
+- **`test_all_apis.py` 在 zmq 部署下全挂**（issue #157，@simonfantasy）：脚本的 `_call` 只会 `call_redis_rpc`——zmq 配置下 ping 必超时、后面每个用例跟着挂，而桥本身是好的（报告人自己用 ZmqTransport 手动 ping 证明了）。现在脚本按配置构造统一调用器（zmq 走 `ZmqTransport`，信封与客户端 `call()` 一致），`redis` 改为懒导入（NO_REDIS_FLAT 无 redis 客户端库的部署也能跑）。实盘验证：本机 zmq 桥上全量 18 OK / 0 超时（`get_sector_list` 的 FAIL 是 #143 之后的诚实报错，`query_stock_position` 空为既有行为，均非本次引入）。
+
+
+## [0.3.15] - 2026-09-03
 
 ### 新增
 
@@ -24,6 +73,8 @@
 
 
 ### 修复
+
+- **无 redis 部署里 `strategy_name` 查询永远回填不上**（issue #156 / #133）：QMT 的委托/成交行根本不携带策略名（终端按它过滤、但不报告），桥靠提交时记的 redis 身份库在查询时回填 —— 但 zmq 单文件等无 redis 部署没有身份库，`strategy_name` 永远读 `''`。现在服务端同时维护一份**进程内身份日志**（提交时记 `remark -> strategy_name`，5000 条 FIFO + 24h TTL，与 redis 店同规则）：没 redis 的部署里，凡本进程提交过的委托，查询都能回填策略名。redis 仍是主店（跨重启、跨进程）。回归测试 6 个（修复前 3 个失败）。
 
 - **zmq 传输 + redis 可达的部署里，委托/成交回调永远收不到**（issue #144，@sumo225270）：服务端发布执行事件是「**redis 优先**」——只要能建出 redis 客户端就发 redis 通道（流带短回放），连挂多次才降级到 zmq 推送通道（#145）。而客户端 `_event_loop` 是**按 transport 选的**——zmq 传输只听 zmq 推送通道。于是这类部署里每个事件都发在 redis 上，客户端却在另一个通道上听：`on_stock_order` / `on_stock_trade` 静默全丢。
 

@@ -5,7 +5,36 @@ The passorder signature follows src/api/qmt_jq_trade.
 
 import hashlib
 
-from xtquant import xtconstant as _xtconstant
+
+class _QmtFallbackXtConstant(object):
+    """QMT 策略沙箱没有可导入 xtquant package 时使用的最小常量集。"""
+
+    FUTURE_ACCOUNT = 1
+    SECURITY_ACCOUNT = 2
+    CREDIT_ACCOUNT = 3
+    FUTURE_OPTION_ACCOUNT = 5
+    STOCK_OPTION_ACCOUNT = 6
+    HUGANGTONG_ACCOUNT = 7
+    SHENGANGTONG_ACCOUNT = 11
+    CREDIT_FIN_BUY = 27
+    CREDIT_SLO_SELL = 28
+    CREDIT_BUY_SECU_REPAY = 29
+    CREDIT_DIRECT_SECU_REPAY = 30
+    CREDIT_SELL_SECU_REPAY = 31
+    CREDIT_DIRECT_CASH_REPAY = 32
+    CREDIT_FIN_BUY_SPECIAL = 40
+    CREDIT_SLO_SELL_SPECIAL = 41
+    CREDIT_BUY_SECU_REPAY_SPECIAL = 42
+    CREDIT_DIRECT_SECU_REPAY_SPECIAL = 43
+    CREDIT_SELL_SECU_REPAY_SPECIAL = 44
+    CREDIT_DIRECT_CASH_REPAY_SPECIAL = 45
+
+
+try:
+    from xtquant import xtconstant as _xtconstant
+except ImportError:
+    # 完整 QMT 的模型运行时会注入 passorder 等 API，但部分券商终端不提供可 import 的 xtquant package。
+    _xtconstant = _QmtFallbackXtConstant()
 
 from ..code_utils import normalize_stock_code
 from ..exec_events import date_time_seconds
@@ -528,8 +557,16 @@ class BigQmtOrderGateway:
                     volume=int(_attr(row, ("m_nVolumeTotalOriginal", "volume"), 0) or 0),
                     traded_volume=int(_attr(row, ("m_nVolumeTraded", "traded_volume"), 0) or 0),
                     status=str(_attr(row, ("m_nOrderStatus", "status"), "") or ""),
+                    # The trade builder has this fallback and orders did not:
+                    # a query filtered by strategy_name returned rows that all
+                    # passed the filter yet reported strategy_name="" (issue
+                    # #156 follow-up). When a filter is given, every row
+                    # belongs to it by construction.
+                    strategy_name=str(
+                        _attr(row, ("m_strStrategyName", "strategy_name"), "")
+                        or strategy_name or ""
+                    ),
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
-                    strategy_name=str(_attr(row, ("m_strStrategyName", "strategy_name"), "") or ""),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     order_time=_order_time_seconds(row),
                     status_msg=_status_message(row),

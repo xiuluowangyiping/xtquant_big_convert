@@ -377,6 +377,10 @@ def normalize_order_event(order, account_id=""):
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
+        # QMT sometimes puts the name right on the object; usually absent and
+        # the publisher fills it from ContextInfo (issue #161).
+        "instrument_name": str(
+            _attr(order, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
@@ -510,6 +514,8 @@ def normalize_trade_event(trade, account_id=""):
         "stock_code": _with_exchange_suffix(
             _attr(trade, ["m_strInstrumentID", "stock_code"], ""), trade
         ),
+        "instrument_name": str(
+            _attr(trade, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
@@ -578,11 +584,16 @@ def publish_exec_event(sink, account_id, event):
 
 
 def _publish(redis_client, channel, event, maxlen=2000):
+    from .adapters.redis_common import note_stream_failure, streams_dead
+
     raw = json.dumps(event, ensure_ascii=False, default=str)
-    try:
-        redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
-    except Exception:
-        pass
+    if not streams_dead():
+        try:
+            redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)
+        except Exception as exc:
+            # redis < 5.0 has no streams: log once, then skip xadd for good.
+            # Anything else stays silent and retried, as before (issue #163).
+            note_stream_failure(exc)
     redis_client.publish(channel, raw)
     return event
 
