@@ -1,9 +1,238 @@
 # Changelog
 
+本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
+
 
 ## [未发布]
 
 ### 修复
+
+- **`qmt.py trades` 现在带上 `strategy_name`**（#174 的后续，客户端工具）：#174 给的绕行办法是「回调拿不到策略名时用查询兜一下」—— 查询路径确实是补全过的（`_attribute_to_strategies`），可照着这个办法用本仓库自己的 CLI 去查成交的人，看到的是查询路径**也**没有策略名。
+
+  字段是在最后一步被丢掉的，不是没送到：只读核对了实盘应答，服务端发的成交行**带** `strategy_name` 这个键（当日 17 笔，17 项俱全），是 CLI 的 `_trade_to_dict` 没把它列进去 —— 委托那侧的 `_order_to_dict` 一直列着。
+
+  取不到时给 `None` 而不是 `""`，和 `trade_amount`（#173）同一个道理：「服务端没发这个字段（该升级了）」和「这笔单确实没有策略名（终端里手工下的，没有备注可查）」是两回事，兜底成空串会把它们抹平。
+
+  **未验证**：这台终端当日 17 笔成交全部是手工单（备注为空），所以实盘只能证到**键在、值为空**，证不到「本桥下的单能查回非空策略名」—— 那要开盘时经由本桥下一单才看得到，而本任务不下单。
+
+
+## [0.3.20] - 2026-09-04
+
+### 新增
+
+- **ORDER 委托行透出成交金额 `trade_amount`**（#173，@feel-think 请求）：ccxt 适配层（QmtExchange）要 order dict 的 `cost`。ORDER 行原生带 `m_dTradeAmount`，但 `OrderSnapshot` 取了 `price_type` / `traded_price`，唯独没取成交金额 —— 金额此前只在 DEAL 行以 `amount` 透出。
+
+  于是拿一笔委托的 cost 只有两条路，都不好：按 `order_sysid` 聚合 DEAL 行（多一次 RPC），或者调用方自己拿 `traded_price × traded_volume` 去算。
+
+  查询路径（`query_orders`）和推送路径（`normalize_order_event`）**同时**透出，否则走回调的调用方拿不到 cost；客户端 `xtquant_compat._order_from_dict` 同步传递。
+
+  **取不到时留 0.0，不拿 `traded_price × traded_volume` 兜底。** 让估算值冒充柜台金额正好是这个 issue 要避开的事，而且 0.0 对未成交委托本来就是对的。旧部署不发这个键时客户端也给 0.0 而不是 AttributeError（#133 就是那个形态）。
+
+  **动手前先查了这台终端到底带不带这个字段。** 只读调 `describe_trade_detail_fields`（0.3.19，当日 14 笔委托）：ORDER 行共 120 个属性，`m_dTradeAmount` 在其中；掩码形状显示 13 笔是四到五位数的金额，唯一一笔 `0.0` 正是 `m_nVolumeTraded` 为 0 的未成交委托。所以它不是一个「存在但恒为空」的字段 —— #133 里的 `m_strShareholderID` 就是那个下场（属性表里根本没有）。
+
+  **已实盘验证**（0.3.19 部署 + `reload_deployment`，只读查询）：当日 14 笔委托全部带上 `trade_amount`，且与按 `order_sysid` 聚合的 DEAL 金额 **14/14 逐笔相等** —— 这是一个独立来源，验的是这个数**确实是成交金额**，不只是"字段出现了"。客户端对象路径（ccxt 取 `cost` 的那条）同样确认：14 个 order 对象都有 `.trade_amount`，合计 117546.00。
+
+  **有一条 issue 里的前提没能复现，如实记下**：「分笔成交时成交均价有舍入，会和柜台差几分」在这台终端上**不成立**。`m_dTradedPrice` 不是两位小数，它带完整精度 —— 当日唯一一笔分价成交（55.14 / 55.13 两笔）报的是 `55.13666666666666`，所以 `traded_price × traded_volume` 与柜台金额**差值为 0**。取这个字段的理由因此不是「修好了差几分」，而是它是**柜台的原值**：不依赖某台终端的 `m_dTradedPrice` 精度，也不用多发一次 RPC 去聚合 DEAL。别的券商的 QMT 若把均价截成两位，估算才会开始漂。
+
+  **未验证**：期货（金额 = 均价×数量×合约乘数）和港股通的 `m_dTradeAmountRMB` 未测；推送路径（`normalize_order_event` 的 `trade_amount`）只有离线用例，当日收盘后没有新委托回调可看，没有实盘样本。
+
+### 修复
+
+- **成交回调终于带上 `strategy_name`，委托回调不再只靠 Redis**（#174，@sumo225270 报告）：`on_stock_order` / `on_stock_trade` 拿到的策略名恒为空，而下单时传的是非空串；`instrument_name` / `order_remark` 一切正常。查下来是**两个**不同的原因。
+
+  **成交事件根本没有这个键** —— 不是空字符串，是不存在，所以客户端 `item.get("strategy_name") or ""` 只可能答 `""`。而且发布路径上只有委托分支做了身份补全：
+
+  ```python
+  if kind == "trade":
+      event = normalize_trade_event(...)     # 没有补全
+  else:
+      event = normalize_order_event(...)
+      event = enrich_order_identity(...)     # 只有这边有
+  ```
+
+  这条**跟配置无关，任何部署下都是空的**。现在 `normalize_trade_event` 产出这个键，两个分支都走同一个补全。
+
+  **委托那条则是大 QMT 自己不给。** 实盘列了全部属性：ORDER 行 120 个、DEAL 行 47 个，**`m_strStrategyName` 两边都没有**（和 #133 的 `m_strShareholderID` 同一形态）；查询路径实测也是 14 笔委托策略名全空。所以只能靠下单时记、回调时按 remark 反查 —— 而这一步此前**只读 Redis**。zmq 部署上 Redis 是可选件，「配置了 ≠ 连得上」（#145 那个坑）时静默失败，名字就永远补不回来。
+
+  现在**先查进程内的 journal（#156，查询路径本来就在用），Redis 作兜底**。这个顺序是有意的：补全跑在 QMT 的 C++ 回调线程上，本进程下的单在 journal 里已经存着和 Redis 一模一样的字符串，先问 Redis 什么也换不来，却要付一次网络往返 —— Redis 配了连不上时更是每个事件都付满超时。Redis 留作兜底是因为它能认出**别的进程**下的单，那是更少见的情况。
+
+  已验证：全量测试 `1499 passed`（112 文件 = 112 模块），13 条新用例修复前 11 条红（另外 2 条是回归保护）；用终端自己的 `xtquant`（91 个名字）预检通过，`bigqmt_signal_trader_strategy` 能干净导入；两个改动文件 AST 无 3.7+ 语法（QMT 只有 Python 3.6）；只读实盘门禁 10/10。
+
+  **未验证**：这是服务端改动，要部署 + **重启策略**（`reload_deployment` 刷不了 `bigqmt_signal_trader_strategy.py`，QMT exec 的就是它）。而且**要等开盘有真实成交回调才能实盘确认** —— 收盘后没有委托/成交回调可看，本次只有离线用例。报告人那侧「remark 是否被 QMT 截断导致键对不上」的怀疑仍未验证，等他贴 `raw_fields`。
+
+- **交易查询 1500ms → 605ms：回复入队后不再空等 router 的接收超时**（issue #104，@sumo225270）：用两侧墙钟时间戳分解（同机，时钟可直接比）后发现，`get_trade_detail_data` 本身**只要 1 毫秒**，1300ms 全在回复构造完之后。
+
+  ```
+  get_positions   等待 201ms | 处理 1.0ms | 回程 1300ms | 总 1500ms
+  ```
+
+  交易查询必须在 adjust 线程上跑，于是 `send_response` 判定「当前线程不是 router 线程」→ 回复入队；而队列**只在 router 循环顶部**排空，那之前隔着一个最多 `RCVTIMEO`（1 秒）的阻塞 `recv`。实测滞留 **10 次平均 1149ms**。
+
+  现在回复入队时通过一条 inproc 管道唤醒 router 线程，循环同时等两端。唤醒失败被吞掉（漏一次只损失延迟，不损失正确性），管道开不起来就保留原阻塞路径。
+
+  实盘：`get_positions` 1500→605ms、`query_orders` 1499→607ms、`get_asset` 1500→608ms，回复滞留 1149→117ms。
+
+  **代价（有意接受）**：`ping` 从 297ms 变 404ms（p50，n=40）—— router 循环从「一次阻塞 recv」变成「poll + 非阻塞 recv」，多的字节码正好落在应答 ping 的那条线程上。交易路径省 ~900ms，而绝大多数只读方法本来走 FormulaServer 直连（0.2ms）不经此路。
+
+  `ping` 一直看不到这个问题（它在 router 线程上就地应答、回复直接发出），我因此一度以为该机制已被证伪 —— 计数验证才翻案：10 次交易查询 + 10 次 ping，入队回复正好 10 条。
+
+- **`qmt.py --table` 不再只画一行空白**（读 CLI，随 #173 的实盘确认一起发现）：`orders --table` 画出表头、分隔线，然后一行纯空格 —— 不管返回了多少数据。同一个查询不加 `--table` 是好的（`count=14`，字段齐全），所以数据没问题，坏的只有渲染。
+
+  子命令交给 `_ok` 的是**为 JSON 设计的形状**，而那通常是个包装：
+
+  ```python
+  _ok({"orders": rows, "count": 14}, table=..., headers=[...])
+  ```
+
+  而 `_ok` 里是 `_print_table(data if isinstance(data, list) else [data], headers)` —— 包装是 dict 不是 list，于是被再包一层当成**一行**，每个表头（`stock_code` …）在它身上都查不到，全渲染成空字符串。
+
+  实测受影响的是 **positions / orders / trades / tick / kline 五个**；**account 和 instrument 本来就是对的**，它们确实只返回一条扁平记录，一行才是正确答案。所以修法不能是"永远取 values"，那会把这两个也弄坏。
+
+  现在 `_ok` 多一个 `table_key` 参数指明包装里哪个键是表格数据（`positions` / `orders` / `trades` / `bars`）；没给 `table_key` 时，**值全是 dict** 的字典按"按键索引"处理、行取 values（`tick` 是 `{code: {...}}`），其余仍当作单条扁平记录。
+
+  已实盘验证（只读）：account 1 行、positions 10 行、orders 14 行、trades 17 行、tick 2 行、kline 3 行，行数与实际数据逐一对上。新测试 10 条，修复前 8 条红 —— 另外 2 条正是 account / instrument 的回归保护，修复前后都该绿。
+
+- **周线（1w）的 preClose 不再恒为 0.0**（#166，@yucejade 报告）：大 QMT 对 `1w` 的每一根 bar 都返回 `preClose = 0.0`。实测（国金 2.1.19.0 / 0.3.19，只读）受影响的**只有 1w**：
+
+  ```
+  period  rows  preClose 非零
+  1d       649  649
+  1w       138    0      <-- 只有它
+  1mon      33   33
+  1q        11   11
+  1hy        6    6
+  1y         3    3
+  ```
+
+  三个标的（000001.SZ / 600000.SH / 600519.SH）、`fill_data` 两种取值下都是 0.0，调用方没有任何参数能把它拿回来。
+
+  现在客户端用**该周首个交易日的日线 preClose** 补齐（`xtquant_compat.get_market_data_ex`）—— 这正是 MiniQMT 的口径，除权日当天它是除权参考价。
+
+  **注意它不等价于 `close[i-1]`。** 两者只在「除权日恰好是当周首个交易日」时分叉，而扫了 6 个流动性好的票 2023-01-01 以来的除权日，**一个这样的用例都没有**（全落在周三/四/五）。所以只拿真实周写的测试会对两种实现都给绿—— 就是 #88 那种「测试和错误前提同源」的形态。因此测试里**构造**了首日除权的周，并另外钉了一个现成判别用例：**窗口里的第一根周线**，`close[i-1]` 对它根本无解。实验过：把实现换成 `close[i-1]`，这些测试 4 条变红。
+
+  周线 bar 的标签是该 ISO 周（周一~周日）的**周日**，实测周线 close 逐周等于该周最后一个交易日的日线 close，19/19 命中（含两个节假缩短周）。所以周首是从标签算出来的，不依赖上一根 bar —— 这才使第一根也能被填上。
+
+  代价和退路：只在「请求了 preClose **且** 整列返回 0.0」时多发一次日线请求（单标的八个月实测 84ms → 614ms；多标的共用同一次日线请求）。终端本来就答得对的周期（包括 1mon/1q）**不付任何额外代价**，没要 preClose 的调用方也不付（#104）。日线请求失败就退回终端原值并告警，不会把整个读取拖下水；某周拿不到日线就**维持 0.0 而不编一个数**。`backfill_pre_close=False` 可关掉，拿回终端原始 bar。
+
+  范围按实测钉死在 `PRE_CLOSE_BACKFILL_PERIODS = ("1w",)`：其他周期在这台终端上本就是对的，要扩到新周期得先做同样的只读实测，不能假定“多日周期都一样”。
+
+  已验证（只读实盘，0.3.19 部署版本一致）：三个标各 23/23 根周线的 preClose 与**独立拉取**的日线 preClose 逐根相等。**未验证**：首日除权周只有构造用例，没有真实市场样本；前/后复权（`dividend_type=front/back`）只验了参数透传，没有逐值校对；期货/期权标的未测。
+
+
+## [0.3.19] - 2026-09-04
+
+### 新增
+
+- **多账号 RPC 服务：一个策略实例、两条 channel，同时服务两个账号**（PR #171，@fancyfanfan）：0.3.18 的 `BIGQMT_ACCOUNT_TYPE_MAP`（PR #135）解决的是「读」—— 查询按请求的 `account_id` 解析 `account_type`。这一条解决「写 + 架构」：
+
+  ```
+  MAP 有多条时：
+    primary service   → adjust 主线程（background_threads=False）
+    secondary service → 后台线程收，交易类请求 defer 到主线程 drain
+    两者共享同一个 BigQmtRpcHandlers
+    SecondaryHandlersProxy 把 secondary 的 account_id 注入 params
+  ```
+
+  **主线程那条硬约束没有被破坏。** `submit_order` / `submit_orders_batch` / `cancel_order` 不在 `READ_METHODS` 里，所以哪怕 secondary 的 `listener_methods=("*",)`，`_expand_listener_methods` 展开后也不包含它们；交易类查询（`LISTENER_DEFERRED_METHODS`）则在展开时被显式减掉。两类都落进 secondary 自己的 `pending` 队列，由 `MultiAccountRpcServiceManager.drain_pending()` 在 adjust 主线程统一执行 —— `get_trade_detail_data` 仍然只在主线程被调用。
+
+  **MAP 为空或只有一条时零行为变化**：`build_multi_account_rpc_service` 直接返回原来那个 service，不做任何包装。
+
+### 修复
+
+- **撤单不再永远用网关自己的账号**（#168，随 PR #171 一起）：`cancel()` 原来两个值都取自网关自身 ——
+
+  ```python
+  account_type = self._resolve_account_type(self.account_id)   # 网关的，不是这笔委托的
+  ok = cancel_func(order_ref.order_sys_id, self.account_id, account_type, self.context_info)
+  ```
+
+  而 `_handle_cancel_order` 第一件事就是 `account_id = self._request_account_id(params)` —— **算出来了，但没往下传**。双账号部署里撤一笔期货委托，会用股票账号的 id 和类型发出去；好一点是撤不掉，差一点是撤到同名的另一笔。又因为 `cancel` 的原生返回值**两个方向都不可信**（#148 返回 false 其实撤成了，#151 返回 true 而委托根本不存在），这个错误未必当场暴露。
+
+  现在 `cancel(order_ref, account_id=None)`，`aid = account_id or self.account_id` —— 单账号传 `None` 时与原来完全等价。
+
+- **部署脚本拒绝把包拷进它自己里面**（PR #169，@karlthas007）：step 2 用 `import bigqmt_signal_trader_strategy` 解析源目录。从 QMT 的 python 目录本身启动脚本时，这个 import 命中的是**已经部署好的文件**，于是 `src == dst`，`Copy-Item` 把包拷进自己：
+
+  ```
+  python\bigqmt_signal_trader\bigqmt_signal_trader\
+  ```
+
+  更麻烦的是外层那份旧包还在原地，而顶层文件被更新了 —— 混出一棵版本不一致的树，直到 RPC 启动才以 `__init__() got an unexpected keyword argument 'default_strategy_name'` 的形式炸出来。现在这种情况直接抛错，并告诉你换个目录跑。
+
+  同一个 PR 还给两处 github 下载失败（redis zip、miniconda 安装包）的报错补上了 `-Proxy` 提示 —— 很多服务器环境直连不到 github.com，而 `-Proxy` 参数本来就有，只是报错里没说。
+
+### 已知限制
+
+- **双账号路由本身没有实盘验证。** 本仓库只有一个账号，且验证终端的 config 里没有 `BIGQMT_ACCOUNT_TYPE_MAP`，因此 `build_multi_account_rpc_service` 走的是「直接返回 primary」那条分支 —— 多账号代码路径**一次都没有被执行过**。dual-channel 收发、`SecondaryHandlersProxy` 的 account_id 注入、secondary 的 `pending` 队列被主线程 drain，这三件事目前只有代码走查和单测支撑。需要 STOCK + FUTURE 同终端的生产环境作证。
+- **撤单按 account_id 路由同理**，只验证了单账号回落路径（`account_id=None` → `self.account_id`）与原行为一致。「期货委托用期货账号撤掉」这半需要双账号环境。
+- 本版发布时实盘终端跑的是 0.3.18；0.3.19 的服务端改动**尚未部署验证**。
+
+## [0.3.18] - 2026-09-04
+
+### 新增
+
+- **`probe_capabilities` 新增 `order_watch`：回答「#164 在这台部署上到底生效没有」**：#164 的接线在 `bigqmt_signal_trader_strategy.py` 里，而 `reload_deployment()` **刷不了顶层文件** —— 也就是说一棵代码齐全的部署树完全可能仍在跑旧的轮询路径，而**没有任何办法分辨**。
+
+  ```json
+  {"wired": true, "remarks": 0, "statuses": 1, "max_entries": 5000, "ttl_seconds": 86400.0}
+  ```
+
+  只报计数，不报 remark 和委托号 —— 那两个是委托标识。`wired` 即「重启是否已生效」。
+
+  实盘用它验完了 #164：策略重启后手工挂撤一笔，`statuses` 0 → 1，证明 QMT 的 `order_callback` 确实在喂表。顺带查出**该功能之前根本没同步到部署**（`order_watch.py` 缺失），而 `redis_rpc.py` 的 `getattr` 兜底让它安静地退回轮询 —— 防御是对的，但功能哑了也看不出来，正是这个探针要解决的问题。
+
+- **`BIGQMT_ACCOUNT_TYPE_MAP`：一个 QMT 进程同时服务股票和期货账号**（PR #135，@fancyfanfan）：网关的 `account_type` 原来是 init 时定死的，单账号部署没问题；一个策略实例服务两个账号时，它必须跟着**请求的 account_id** 走，否则期货账号会被当成 STOCK 查 —— 和 #92 是同一类 bug（信用账号被当 STOCK 查会返回一整行 0 且不报错）。
+
+  ```python
+  BIGQMT_ACCOUNT_TYPE_MAP = {
+      "88888888": "STOCK",
+      "66666666": "FUTURE",
+  }
+  ```
+
+  **不配这一项时行为完全不变** —— 查不到映射就回落到网关自己的 `account_type`。实盘验证过（本终端没配该项）：`account_type` / 现金 / 持仓数 / 持仓统计 / 委托 / 成交逐项一致。
+
+  **已知缺口**：撤单仍是单账号的 —— `OrderRef` 不带 account_id，`cancel()` 用的是网关自己的 `self.account_id`，所以双账号部署里撤期货委托会用股票账号 id 发出去。已单独开跟进。
+
+  **双账号本身未在本仓库验证**：这里只有一个账号，该路径由报告人的生产环境作证。
+
+
+### 修复
+
+- **`get_divid_factors` 的区间请求被坍缩成只查 `end_time` 单日**（issue #165，@yucejade）：任意区间都被压成一天，而任何一天几乎都不是除权日，于是区间请求恒返回 `{}` —— 而空 dict 和「区间内没有事件」**完全分不出来**。报告人按 xtdata 区间语义做的盘前全市场复权因子同步就这样跑了近一个月：每只都空，因子表静默停更，K 线照常更新，一声不响。
+
+  代码里原来的注释写着「xtdata SDK 也是 2 参数」——**这句是错的**，终端自带 SDK 是 `get_divid_factors(stock_code, start_time, end_time)`。
+
+  现在先试区间形态（原生 SDK / ContextInfo），都不支持才在适配层展开。展开**不逐日遍历**：除权日恰好就是「`preClose` 与上一根 `close` 不同」的那天（那正是除权参考价的含义），所以一次日线读取就能把两年窗口收敛到几个候选日，只探测这几天。探测数有上限（40），防止筛不动时打出几百个 RPC。
+
+  实盘验证（国金 2.1.19.0）：
+
+  ```
+  000001.SZ 20240101~20260904  ->  5 个事件（原来是 {}）
+  600000.SH 20240101~20260904  ->  2 个事件（原来是 {}）
+  单日 20260612                ->  0.36，与报告人自测一致
+  ```
+
+  区间结果里包含报告人**独立确认过**的 2025-10-15 中期分红（0.236）。
+
+  **一个必须说清的限制**：扫描依赖本地日线。日线不足 2 根时无法做哪怕一次比较，此时**抛错而不是返回 `{}`** —— 否则就是把本 issue 的失败模式换个窄一点的形式重造一遍。实盘验证：`300750.SZ`（本机只有 1 根日线）现在报错并提示先 `download_history_data`，而不是静默给空。
+
+- **`fill_data` 传不到大 QMT，停牌/无数据被静默填成 0 行且关不掉**（issue #167，@zxm9999）：报告人直接指出了断点 —— `_market_data_shapes()` 的 `big_kwargs` 没带 `fill_data`，而它是**第一个被尝试**的 shape，调用成功，参数就被无声丢弃了。
+
+  大 QMT 是接受这个参数的（文档 5.x：`C.get_market_data_ex(fields, stock_code, period, start_time, end_time, count, dividend_type, fill_data, subscribe)`，终端自带 SDK 签名一致）。
+
+  **后果比「参数被忽略」严重**。实盘实测（20260101~20260904，日线，15 只）：
+
+  ```
+  300750.SZ   fill_data=True -> 164 行，其中 163 行 close = 0.0
+              fill_data=False ->   1 行（真实数据）
+  15 只里 9 只行数不同
+  ```
+
+  也就是说：本地没有下载完整历史的代码，过去一律返回一个**结构完好、99% 是 0** 的 164 行 DataFrame，而调用方**没有办法关掉填充**。在这种帧上算收益率/均线/波动率，拿到的全是垃圾，而且不报错。
+
+  修法：`fill_data` 单独放进一个 shape，排在原来那个不带它的 shape **之前**，而不是直接加进 `big_kwargs` —— `_call_first_supported` 只在 `TypeError` 时回落，所以签名里没有这个参数的终端仍然要能落到原来的 shape 上。`get_market_data` / `get_local_data` 同样处理。
+
+  实盘验证：本终端接受该参数（第一个 shape 直接成功，没有回落），且 `True`/`False` 的返回**确有差异**。新增 11 个测试，修复前 9 个失败。
 
 - **结算不再盲轮询：回调把委托号/状态推给我们了**（issue #164）：下单/撤单结算原来在 adjust 主线程上一轮一轮 `query_orders`（实测一次撤单 3.6s 打了 135 轮）。新增回调喂养的 `OrderWatchTable`（remark→委托号、委托号→状态，有界 FIFO + 24h TTL，C++ 回调线程写、adjust 线程读，普通 dict+锁）：结算先查表，命中即结算、零轮询；查不到回落原有轮询（模拟模式没有回调，轮询保留为兜底）。单测 11 个（含两条快路径零查询、回退路径、表语义/TTL/有界）。**生效需重启策略**（改了顶层 strategy 文件）。
 
@@ -14,9 +243,6 @@
 - **`download_holiday_data` / `download_his_st_data` 在大 QMT 上抛 NotImplementedError**（issue #163，@Randall-Chan）：MiniQMT 这两个是从 xtdata 服务下载假日表/ST 历史；大 QMT 终端自己维护这些数据（登录/数据更新时刷新），没有要下载的东西。现在明确回答 no-op + 说明（之前走通用兜底报 NotImplementedError，用户只能注销那两行）。实盘验证：两个调用都返回 `ok: True, downloaded: False` + 说明。客户端补上漏掉的 `download_his_st_data` 方法。
 
 - **redis < 5.0 没有 streams，每个 tick 都在抛 `unknown command 'XADD'`**（issue #163）：事件回放流和持仓事件流都要 XADD，Windows 上常见的老 redis（3.0.x）没有这命令。现在第一次失败就学到并永久跳过 xadd（日志只说一次），pub/sub 回调不受影响（老 redis 上实时回调一直是通的）；升 redis ≥ 5.0 回放自动恢复。瞬时故障不会误触发。回归测试 6 个（修复前全失败）。
-
-
-本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
 ## [0.3.17] - 2026-09-03

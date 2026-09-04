@@ -593,11 +593,12 @@ class BigQmtRpcHandlers:
             "allow_order_methods": bool(self.allow_order_methods),
             "rpc_revision": RPC_REVISION,
             "version": _deployed_version(),
-            "account_type": self._reported_account_type(),
+            "account_type": self._reported_account_type(
+                params.get("account_id") or self.account_id),
             "server_time": _dt.datetime.now(),
         }
 
-    def _reported_account_type(self):
+    def _reported_account_type(self, account_id=None):
         """What this deployment will actually trade as.
 
         The client's StockAccount(..., "CREDIT") never reaches the server --
@@ -605,10 +606,16 @@ class BigQmtRpcHandlers:
         caller declaring CREDIT against a STOCK deployment has no way to see
         the mismatch. It shows up as an all-zero credit asset row instead
         (issue #92). Empty when there is no gateway to ask.
+
+        When account_id is given and the gateway supports per-request
+        resolution, the map-aware type is returned (same #92 class of bug
+        for multi-account deployments where a FUTURE account sees "STOCK").
         """
         gateway = self.order_gateway
         if gateway is None:
             return ""
+        if account_id is not None and hasattr(gateway, "_resolve_account_type"):
+            return str(gateway._resolve_account_type(account_id) or "").strip().upper()
         return str(getattr(gateway, "account_type", "") or "").strip().upper()
 
     def _handle_get_deployment_info(self, params):
@@ -740,7 +747,54 @@ class BigQmtRpcHandlers:
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                 }
         info["sector_probe"] = self._probe_sector_channels()
+        info["order_watch"] = self._probe_order_watch()
+        info["reply_residency"] = self._probe_reply_residency()
         return info
+
+    def _probe_reply_residency(self):
+        """How long finished replies wait for the transport to send them.
+
+        Handlers run on the adjust thread, so on zmq every reply is queued for
+        the router thread and only leaves at the top of its loop. This says
+        whether that wait is where the round trip goes (#104).
+        """
+        transport = getattr(self, "rpc_transport", None)
+        stats = getattr(transport, "reply_residency_stats", None)
+        if not callable(stats):
+            return {"available": False}
+        try:
+            report = dict(stats())
+        except Exception as exc:
+            return {"available": False,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        report["available"] = True
+        return report
+
+    def _probe_order_watch(self):
+        """Is the callback-fed settlement table live here (issue #164)?
+
+        The table is wired onto the handlers by bigqmt_signal_trader_strategy,
+        a top-level file QMT execs -- reload_deployment cannot refresh it. So a
+        deployment can carry every line of the #164 code and still be running
+        the old poll loop until someone restarts the strategy, with nothing to
+        tell the two apart. This says which one is running.
+
+        Counts only: remarks and order ids identify orders.
+        """
+        table = getattr(self, "order_watch_table", None)
+        if table is None:
+            return {
+                "wired": False,
+                "note": ("settlement is polling; the watch table is wired in "
+                         "the strategy file, which needs a strategy RESTART "
+                         "(reload_deployment cannot refresh it)"),
+            }
+        report = {"wired": True}
+        try:
+            report.update(table.stats())
+        except Exception as exc:
+            report["stats_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        return report
 
     # 板块通道探测（issue #143）。写入板块有三条可能的通道，名字还各不相同：
     #   * ContextInfo.create_sector           大 QMT 内置 Python
@@ -1238,9 +1292,29 @@ class BigQmtRpcHandlers:
         # Some brokers hand back rows even here; normalise rather than drop.
         return _normalize_detail_rows(data)
 
-    def _configured_account_type(self):
+    def _configured_account_type(self, account_id=None):
+        """The account type this deployment will trade as, per-request aware.
+
+        When the gateway supports per-request account_type resolution (i.e.
+        has ``_resolve_account_type`` from BIGQMT_ACCOUNT_TYPE_MAP), this
+        returns the map-aware type for the given account_id.  When no map
+        is configured, returns the gateway's own ``account_type`` unchanged.
+
+        The *account_id* parameter is explicit (not read from instance state)
+        because zmq deployments have a background listener thread calling
+        market-data methods concurrently with the adjust thread calling trade
+        methods -- storing params on ``self`` would race (issue #43, #164).
+        """
+        gateway = self.order_gateway
+        if gateway is not None and hasattr(gateway, "_resolve_account_type"):
+            try:
+                aid = account_id or self.account_id or ""
+                if aid:
+                    return str(gateway._resolve_account_type(aid)).strip().upper()
+            except Exception:
+                pass
         return str(
-            getattr(self.order_gateway, "account_type", "CREDIT") or "CREDIT"
+            getattr(gateway, "account_type", "CREDIT") or "CREDIT"
         ).strip().upper()
 
     def _query_trade_detail(self, params, detail_type, strategy_name=""):
@@ -1254,8 +1328,11 @@ class BigQmtRpcHandlers:
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
             return []
+        account_type = (gateway._resolve_account_type(account_id)
+                        if hasattr(gateway, "_resolve_account_type")
+                        else getattr(gateway, "account_type", "STOCK"))
         try:
-            rows = gateway.get_trade_detail_data(account_id, gateway.account_type, detail_type, strategy_name)
+            rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
             return _normalize_detail_rows(rows)
         except Exception:
             return []
@@ -1277,7 +1354,7 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global(
             "get_unclosed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_query_credit_subjects(self, params):
@@ -1357,14 +1434,14 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global(
             "get_unclosed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_get_closed_compacts(self, params):
         return self._call_qmt_global(
             "get_closed_compacts",
             self._request_account_id(params),
-            self._configured_account_type(),
+            self._configured_account_type(self._request_account_id(params)),
         )
 
     def _handle_get_debt_contract(self, params):
@@ -1895,7 +1972,7 @@ class BigQmtRpcHandlers:
             order_sys_id=order_sys_id,
             user_order_id=str(params.get("user_order_id") or ""),
         )
-        result = self.order_gateway.cancel(order_ref)
+        result = self.order_gateway.cancel(order_ref, account_id=account_id)
 
         # The native cancel return is not trustworthy in EITHER direction.
         # #148: falsey while the broker accepted the cancel (status became 54
@@ -2221,6 +2298,13 @@ class RedisPubSubRpcService:
                 print_prefix=print_prefix,
             )
         self._transport = transport
+        # Let the handlers reach the transport for read-only diagnostics
+        # (reply-queue residency, #104). Set here rather than in the
+        # strategy file so a reload picks it up without a restart.
+        try:
+            self.handlers.rpc_transport = transport
+        except Exception:
+            pass
         # Route inbound raw payloads through the service's dispatch (which
         # applies the inline-vs-deferred fork) instead of transport.deliver().
         self._transport.on_raw_payload = self._handle_received_payload
@@ -2489,6 +2573,11 @@ class RedisPubSubRpcService:
             # problem. Lets clients see why an operation silently failed.
             "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            # Wall clock, not perf_counter: the client is a separate process
+            # on the same machine, so these are directly comparable to its own
+            # time.time() and decompose the round trip into wait / handle /
+            # return without guessing (#104).
+            "_t_recv": time.time(),
         }
         try:
             if self.account_id and account_id and account_id != self.account_id:
@@ -2525,6 +2614,7 @@ class RedisPubSubRpcService:
                 return response
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
+        response["_t_reply"] = time.time()
         try:
             self._publish_response(request, response)
         except Exception:

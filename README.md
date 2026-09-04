@@ -16,6 +16,19 @@
 
 ---
 
+### 讨论组：微信群「qmt 交流群」
+
+用微信扫码进群：
+
+<img src="docs/assets/wechat-group-qr.jpg" alt="qmt 交流群" width="320">
+
+> **二维码会过期。** 这张是 2026-09-04 生成的，微信群邀请码 7 天有效（本张到 2026-09-11）。
+> 过期后扫码会提示无效 —— 这不是项目的问题，[开个 issue](https://github.com/litaolemo/xtquant_big_convert/issues) 说一声，会换新的。
+
+提 bug 和功能请求请走 [issue](https://github.com/litaolemo/xtquant_big_convert/issues)：群里的讨论不会被检索到，而 issue 会 —— 下一个遇到同样问题的人能搜到。
+
+---
+
 ### 配置向导：`bigqmt-init`
 
 不想手动抄两份 `.example.py`、也不想搞清楚三十来个键里哪些真的要改，直接跑：
