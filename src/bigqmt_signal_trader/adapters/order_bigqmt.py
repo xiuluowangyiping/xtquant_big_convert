@@ -128,6 +128,34 @@ def _first_nonzero(row, names, default=0.0):
     return default
 
 
+# 报单来源 last -- see exec_events._STRATEGY_NAME_FIELDS for why it belongs
+# here at all. Kept character-for-character the same as that table, so a row
+# and the event for the same order cannot disagree about who placed it; a
+# literal copy rather than an import, because order_bigqmt is on the sandbox's
+# single-file import graph. tests/.../test_order_source_strategy_name.py pins
+# the two together. "strategyName" cannot appear on a native ORDER/DEAL row
+# (and _attr here reads attributes only, never dict keys), so carrying it
+# costs a miss on a name no row has -- cheaper than two tables drifting apart.
+_STRATEGY_NAME_FIELDS = (
+    "strategyName", "m_strStrategyName", "strategy_name", "m_strSource",
+)
+
+
+def _row_strategy_name(row):
+    """First NON-EMPTY strategy-name candidate on a QMT row, or "".
+
+    _attr stops at the first non-None and "" is not None, so m_strStrategyName
+    present-but-blank -- which is what this terminal reports for every row --
+    would shadow m_strSource and answer "unnamed" for an order that names
+    itself.
+    """
+    for name in _STRATEGY_NAME_FIELDS:
+        text = str(_attr(row, (name,), "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
 def _data_attribute_names(row):
     """Public non-callable attribute names on a QMT row object.
 
@@ -540,6 +568,70 @@ class BigQmtOrderGateway:
             message="passorder submitted",
         )
 
+    def passorder_passthrough(
+        self,
+        op_type,
+        order_type,
+        account_id,
+        order_code,
+        price_type,
+        price,
+        volume,
+        strategy_name,
+        quick_trade,
+        user_order_id,
+        dry_run=False,
+    ):
+        """Call QMT's native passorder with the 11-arg signature untouched.
+
+        The deliberate escape hatch (route 2): the caller controls every
+        argument, including orderType (股/手 vs 金额 vs 比例 vs 组合) and
+        quickTrade, which submit()/order_stock do not expose. NONE of submit()'s
+        safety nets run here -- no opType validation (a credit or futures opType
+        that submit() would guard becomes the caller's responsibility, see
+        #103), no code case-normalization (#95), no settlement read-back. The
+        caller asked for the native API, so they own its contract.
+
+        ContextInfo is supplied here, not by the caller: passorder reads
+        internals off the raw QMT ContextInfo (e.g. .request_id) and it only
+        exists inside QMT, so it can never travel over RPC.
+
+        ``dry_run`` resolves everything and returns the exact 11-tuple that
+        WOULD be sent, without calling passorder. It is how this path is
+        verified against the live terminal without placing an order, and it
+        lets a caller confirm their own argument mapping the same way.
+
+        passorder itself is async and returns None (QMT assigns the 合同编号
+        later, on the order_callback push), so there is no order id to return
+        synchronously -- exactly as with order_stock_async.
+        """
+        passorder = self._require_passorder()
+        args = [
+            int(op_type),
+            int(order_type),
+            str(account_id or self.account_id),
+            str(order_code),                 # RAW: no normalization (#95)
+            int(price_type),
+            float(price),
+            int(volume),
+            str(strategy_name or ""),
+            int(quick_trade),
+            str(user_order_id or ""),
+        ]
+        if dry_run:
+            return {
+                "dry_run": True,
+                "would_call": "passorder",
+                "args": list(args),
+                "context_info_supplied": self.context_info is not None,
+            }
+        passorder(*(args + [self.context_info]))
+        return {
+            "dry_run": False,
+            "submitted": True,
+            "user_order_id": args[9],
+        }
+
     def cancel(self, order_ref, account_id=None):
         cancel_func = self._require_cancel()
         aid = account_id or self.account_id
@@ -583,10 +675,11 @@ class BigQmtOrderGateway:
                     # passed the filter yet reported strategy_name="" (issue
                     # #156 follow-up). When a filter is given, every row
                     # belongs to it by construction.
-                    strategy_name=str(
-                        _attr(row, ("m_strStrategyName", "strategy_name"), "")
-                        or strategy_name or ""
-                    ),
+                    #
+                    # The row's own 报单来源 now counts as "the row said so"
+                    # (issue #174), so an unfiltered query names bridge-placed
+                    # orders instead of leaning on the identity store.
+                    strategy_name=_row_strategy_name(row) or strategy_name or "",
                     price=float(_attr(row, ("m_dLimitPrice", "m_dPrice", "price"), 0.0) or 0.0),
                     remark=str(_attr(row, ("m_strRemark", "remark"), "") or ""),
                     order_time=_order_time_seconds(row),
@@ -678,18 +771,18 @@ class BigQmtOrderGateway:
                     # 官方 Deal 字段: m_dTradeAmount 成交额; m_strTradeDate+
                     # m_strTradeTime 合成 Unix 秒; 策略名来自查询过滤参数。
                     amount=float(_attr(row, ("m_dTradeAmount", "amount"), 0.0) or 0.0),
-                    # The row's own strategy name first -- though on this
-                    # terminal there is none: neither ORDER nor DEAL rows carry
-                    # m_strStrategyName. QMT filters by strategy without ever
-                    # reporting it, which is why the field read "" for
-                    # everything (issue #133). The filter is the fallback: when
-                    # one IS given every row belongs to it by construction. For
-                    # orders this bridge submitted, the RPC layer puts the real
-                    # name back from the identity store.
-                    strategy_name=str(
-                        _attr(row, ("m_strStrategyName", "strategy_name"), "")
-                        or strategy_name or ""
-                    ),
+                    # The row's own strategy name first. m_strStrategyName is
+                    # genuinely absent here -- but the name is not: it comes
+                    # back in 报单来源 (m_strSource), which is passorder's
+                    # strategyName argument (issue #174, and #154 measured it).
+                    # Reading only m_strStrategyName is why this field answered
+                    # "" for everything (issue #133).
+                    #
+                    # The filter is the fallback: when one IS given every row
+                    # belongs to it by construction. For orders this bridge
+                    # submitted with no filter, the RPC layer still backstops
+                    # from the identity store.
+                    strategy_name=_row_strategy_name(row) or strategy_name or "",
                     traded_time=date_time_seconds(
                         _attr(row, ("m_strTradeDate", "trade_date", "m_strDealDate")),
                         traded_at_raw,

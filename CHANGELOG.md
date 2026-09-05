@@ -3,9 +3,131 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
-## [未发布]
+## [0.3.22] - 2026-09-05
+
+### 新增
+
+- **`passorder` 原生透传（路 2）**：新增客户端 `xt.passorder(opType, orderType, account, orderCode, prType, price, volume, strategyName, quickTrade, userOrderId)`，参数顺序与 QMT 原生 `passorder` 一致，ContextInfo 由服务端补（它只在 QMT 里存在，过不了 RPC）。和 `order_stock` 的区别是**暴露了 `orderType` 和 `quickTrade`**，并且**不跑任何安全网** —— 无 opType 校验（融资/期货 opType 由调用方负责，见 #103）、无代码大小写归一化（#95）、无结算回读。要的就是裸 API，契约归调用方。
+
+  `orderType` / `quickTrade` 留空时回落到服务端配置（1101 / 2），所以常见情形写起来仍和 `order_stock` 一样。passorder 异步、不返回委托号（QMT 稍后在 order_callback 推送里给），同 `order_stock_async`。
+
+  `dry_run=True` 返回服务端**将要**传给 passorder 的 11 元组而不下单 —— 用来核对参数映射，也是本条的实盘验证方式（不下真单）。
+
+  服务端 `passorder` 走 `ORDER_METHODS`：和其它下单一样受 `rpc_allow_order_methods` 门禁、并 defer 到 adjust 主线程。新增 `tests/bigqmt_signal_trader/test_passorder_passthrough.py`（11 例，下单类放文件最前，修复前 8 例红）。实盘 dry_run 四项验证通过，未下任何单。
+
+### 性能
+
+- **zmq 客户端不再把并发请求排成一队**（#186）：`send_request` 此前在**整个** send/poll/recv 周期内持 `_client_lock`，因为客户端只有一个 DEALER socket 而 zmq socket 不是线程安全的。于是多线程调用只能轮流来。实盘 4 并发实测：zmq 的 ping 从 2.4 只到 2.7 次每秒（drain 模式 10.2 到 10.2，纹丝不动），而没有这把锁的 redis 从 20.7 到 **143.3**。线程数在 zmq 上买不到任何东西。
+
+  改成 zmq 自己的答案 —— **每个调用线程一个 socket**，各自随机 IDENTITY，服务端 ROUTER 把回复路由回发起的那个线程 —— 而不是给共享 socket 加锁。`_client_lock` 现在只保护注册表。
+
+  一个线程一个 socket 的风险是泄漏：按请求开线程的调用方会给每个线程留一条到 ROUTER 的 TCP 连接。所以建新 socket 时顺带回收已退出线程的（它们的 owner 已经消失，不可能有人正在其中收发，这正是可以从别的线程关掉它们的理由），`stop()` 关掉全部。
+
+  **实盘未验证**：这是纯客户端改动，而当前部署跑的是 redis transport，根本不经过这段代码；要验它得把终端换成 zmq 再重启。离线用假 socket 钉住了真正的回归 —— 4 个并发调用在一次 0.3 秒往返里必须重叠而不是排队（修复前 4 例红）。
 
 ### 修复
+
+- **批量 RPC 超时后不再回退重提 —— 双倍下单（#195，实盘 100 单变 200 单）**：`order_stock_async` 的积压走一个批量 RPC，服务端在 adjust 线程上串行执行（柜台断连时 ~300ms/项，100 项 >30s 默认超时）。客户端超时放弃后，旧兜底「逐笔重提」启动 —— 但**服务端的批量还在跑而且会跑完**，于是 100 + 100 = 200 单。超时不等于没执行。
+
+  现在 `call()` 对**服务端已应答**的错误改抛 `RpcServerRepliedError`（`RuntimeError` 子类，向后兼容）：批量 handler 只在逐项循环之前抛错，所以「被拒绝 = 一笔没跑」，只有它和「返回空结果」允许回退逐笔。超时/断连一律视为**生死未知**：逐项回调 `on_order_error`，信息明说「orders MAY BE LIVE -- query orders before retrying」，**不再自动重提**。
+
+  `order_stock_batch` 的等待时长随 N 缩放（`max(客户端默认, 15s + 0.5s×N)`，显式 `timeout_seconds` 优先）——让客户端比服务端最慢的合法批量活得久，而不是中途放弃它。服务端新增每个批量一行日志（items/placed/failed/耗时）：超时后仍跑完的批量此前在服务端无迹可寻。
+
+  **实盘 A/B 复现**（周六，废单场景，200 笔逆回购）：0.3.21 旧客户端 → 身份库铁证 **400/200**（双倍原样复现）；修复版客户端同场景 → **零重提**（200 个 MAY-BE-LIVE 错误），服务端最终只执行了原始的 200。顺带修了三个 #185 时期测试 fake 缺 `idempotent` 形参的间歇性失败。
+
+- **多账户 `stop()` 时关闭辅助 listen_redis 连接**（#194）：`MultiAccountRpcServiceManager.stop()` 此前漏关多账户管理器为监听建的第二个 redis 连接，进程退出时可能挂住。
+
+- **runtime 入口转发 quote_push 配置**（#198）：`BIGQMT_REDIS_CONFIG` 里的 `quote_push` 块此前被 runtime 丢弃，策略端永远拿到默认值。
+
+### 测试
+
+- **#190 报告场景固化为端到端回归**（#192）：20 笔无 remark 的 `order_stock_async` 紧凑循环，经真实 worker/批量/回调分发 + 真实服务端 handler（dry-run 网关），钉住 20/20 进入提交路径、回调按 seq 序、自动补的 tag 不塌缩。已验证对修复前代码为红。
+
+- **redis transport 停止时不再甩完整 traceback**（#189）：`stop()` 在监听线程正停在 `get_message(timeout=1.0)` 时把 pubsub 关掉，socket 在它脚下失效 —— Windows 上是 `WinError 10038` 包在 `redis.exceptions.ConnectionError` 里，而循环的裸 `except Exception` 把整个栈打出来，实盘一次重启三条。
+
+  纯噪声，但代价是真的：**正常关闭和真故障长得一模一样**，读的人学会忽略这个 traceback 之后，真出问题那次也会被忽略。现在 `except` 里先看 `self._running`，已经在停就安静退出；队列循环同样处理。
+
+  **实盘前后对照**：同一台桥、同一个 reload 操作，只换代码 —— 拆旧代码的那次 **3 个 traceback**（正是报告里的数量），拆新代码的那次 **0 个**。离线四例覆盖两个循环的安静退出，以及**运行中仍然大声报错**的负面对照 —— 让关闭安静下来不能顺带让故障也安静。
+
+## [0.3.21] - 2026-09-04
+
+### 性能
+
+- **zmq / mysql 现在也能走 adjust 线程 drain，实盘延迟降 4~6 倍**（#183，#104）：显式把 `rpc_background_threads` 设成 `False`，zmq/mysql 不再起自己的接收线程，改由 adjust 每 tick 直接收/处理/发，消掉全部跨线程 GIL 交接。配置里没写这个键时保持历史默认（开后台线程），所以不改配置的部署行为不变。
+
+  **实盘四格实测**（0.3.20，收盘后，`schedule_adjust_interval: "100nMilliSecond"`，同一套只读脚本，每格重启策略后现测）：
+
+  | 配置 | ping p50 / p90 | positions p50 / p90 | 串行吞吐（ping / positions） |
+  |---|---|---|---|
+  | zmq + 后台线程（本次改动前） | 404.5 / 408.0ms | 607.0 / 704.7ms | 2.4 / 1.7 次每秒 |
+  | **zmq + drain（本次）** | **95.1 / 109.8ms** | **95.2 / 110.2ms** | **10.2 / 10.0 次每秒** |
+  | redis + drain | 12.6 / 14.7ms | 31.1 / 33.2ms | 76.3 / 21.0 次每秒 |
+  | redis + 后台线程 | 10.1 / 105.0ms | 4.1 / 4.8ms | 20.7 / 195.3 次每秒 |
+
+  除了变快，分布也变稳了：95~110ms 正好是一个 adjust tick，改动前那种 400ms 尖峰消失。持仓答的是 10 行真实数据（总资产对得上），不是空壳 —— 按 `get_trade_detail_data` 离开主线程必返回空这条铁律，这证明 drain 确实跑在主线程上。
+
+  **redis 不要跟着设 `False`**。实测 redis 上开 drain 是负优化：交易查询从 4.1ms 掉到 31.1ms、吞吐从 195 掉到 21 次每秒。原因是 drain 每 tick 只轮询一次，请求要等下一个 tick；redis 的阻塞 `brpop` 是请求一落队列就推回来。resolver 对 redis 保持 `bool(configured)` 的原有语义没变，但配置里默认值应当继续是后台线程。
+
+  **同一批实测暴露的三件事，都已单独记录**：zmq 客户端 `send_request` 全程持单 socket 锁，并发拿不到任何吞吐收益（#186，zmq 上 2.4→2.7、10.2→10.2，而 redis 上 20.7→143.3）；README 的 transport 性能表与实测相反，正把用户引向最慢的配置（#187）；纯 zmq / 单文件入口强制 `rpc_background_threads = True`，最需要低延迟的那批部署吃不到本次改动（#188）。
+
+  **未验证**：只在 zmq 和 redis 上量过，mysql 和 shm 没测；只在收盘后量过，盘中 QMT 主线程更忙时的数字可能不同；只覆盖了 `ping`（inline）和 `query_stock_positions`（deferred）两个方法，没有下单路径 —— 本次测量不下单。
+
+- **纯 zmq / 单文件部署不再被入口强制开后台线程**（#188）：#183 让 zmq/mysql 可以用显式 `rpc_background_threads: False` 换到 adjust drain，但 `BIGQMT_ZMQ_DRYRUN.py` 设 `BIGQMT_FORCE_TRANSPORT = "zmq"` 之后，入口无条件把这个键赋成 `True` —— **最想要低延迟的那批部署恰好是拿不到的那批**，而且用户在自己配置里写的 `False` 被静默忽略。改成 `setdefault`：没写这个键仍然沿用历史默认 `True`，写了就听用户的。单文件构建器同样处理，它那条 `background_threads=True` 的横幅也改成报告实际用到的值 —— 一条永远说 True 的日志比没有日志更坏，那是「drain 怎么没生效」时第一个会去看的地方。
+
+  实盘验不了这条（要换成纯 zmq 入口再重启策略），所以按仓库对入口文件一贯的做法做源码级钉子；「显式 False 能一路传到 resolver」那一半由 `test_transport_selection.py` 覆盖。
+
+### 文档
+
+- **README 与 docs 的 transport 性能表是反的，已按实测重写**（#187）：此前写着 zmq「同机低延迟 p50~0.7ms」、redis 13ms，还有三处叫用户切 zmq 时「必须」设 `rpc_background_threads: True`。实测 **redis 比 zmq 快 8~60 倍**（ping 10ms vs 95ms，交易查询 4ms vs 95ms），那个 0.7ms 是撞上 adjust 空窗的最好情况而不是 p50，redis 的 13ms 反倒一直是准的。这不只是文档不准 —— 它把追求低延迟的用户直接引到最慢的配置上，而且没有任何反馈能让他们发现选错了；本仓库自己的实盘部署就一直跑在 zmq 上。
+
+  README 的传输表、FormulaServer 对比表、基准表、配置注释、排查指引，以及 `docs/RPC_TRANSPORTS.md` 的传输表和实测段全部更新，并注明「0.3.21 之前这张表是反的」。三处「必须设 True」改成推荐 `False`。顺带记上 zmq 客户端并发无效（#186）—— 只有 redis 上多线程能提升吞吐。
+
+### 修复
+
+- **异步下单被批量端点吞掉，而且吞掉的单返回 success**（#190，实盘报告，#181 的回归）：0.3.20 正常，之后的 main 上「循环里单独调用下单一单也下不出去，插一个别的调用就又能下」，以及「同时下很多单、回调回来一堆、委托列表里只有一单」。两条是同一个根因。
+
+  #181 让 `order_stock_async` 的积压走 `order_stock_batch` 省往返，于是异步下单继承了一份它从没答应过的契约。`_handle_submit_order` 在没有 remark 时自动补 `bqrpc:<uuid>` 且从不去重；`_handle_submit_orders_batch` 两样都相反 —— 缺 tag 直接答 `ORDER_TAG_REQUIRED`（**没写 remark 是异步的常态**，于是一单不下），tag 见过就答 `success: True, idempotent: True` 却根本不到 gateway（**remark 重复对异步完全合法**，于是只下一单）。「插一个别的调用就能下」是批量阈值：队列里只剩一笔时走单笔路径，把循环放慢就把 bug 藏起来了。
+
+  最危险的是被吞掉的单**返回 success**，调用方无从分辨。离线复现的原文是 `reported 2 successes for 1 placed orders`。
+
+  修法是让异步路径**显式退出**幂等契约，`order_stock_batch` 的默认行为一个字不动 —— 它的幂等是防重试重复下单的保险丝，不是可以顺手拆掉的东西。服务端接受 `idempotent`（默认 `True`）；为 `False` 时缺 tag 照单笔路径补 uuid、不去重、也不写 journal（异步的 remark 不是身份，记下来会压掉后面真正的批量单）。客户端 `_submit_async_batch` 传 `False`，并给每项补唯一 `signal_id` —— 对着还不认这个开关的旧服务端，无 remark 的情况也能靠 tag 回落到 signal_id 而不撞去重。
+
+  **实盘前后对照，未下任何单**：报告人的场景原样复现 —— 紧凑 while 循环调 `order_stock_async`、不插查询、不带 remark，每项 `order_volume=0`，在 `_handle_submit_order` 的 `volume must be positive` 就退出，到不了 passorder。同一台桥、同一个脚本，只换服务端与客户端版本：
+
+  | 场景 | 修复前 | 修复后 |
+  |---|---|---|
+  | 无 remark，8 笔 | **0/8 到达提交路径，8 笔全被 `ORDER_TAG_REQUIRED` 拦** | **8/8** |
+  | 无 remark 走默认契约 | `ORDER_TAG_REQUIRED` | `ORDER_TAG_REQUIRED`（未变） |
+
+  「连第一单都下不出去」在这里看得很清楚：批次里 index 0 和其余各笔一样被拒，不是「第一单成功、后面被去重」。
+
+  **去重那一半没有实盘证据，只有离线测试**。这个探针证不了它：幂等去重靠 `_submit_journal`，而 journal 只在提交成功之后才写；`volume=0` 让每笔都在写 journal 之前抛错，于是去重根本没机会触发 —— 修复前修复后同样是 8/8。要在实盘证它必须真下单。离线用 DryRun gateway 提交会成功、journal 会写，那里 3 笔同 remark 修复前只下 1 笔、修复后 3 笔全下。
+
+  **未验证**：没真下过单，所以证不到「循环里 N 笔异步单最终在委托列表里出现 N 行」。
+
+  **影响范围**：`66c344a`（#181）不在任何 tag 里，这个 bug 从未发布到 PyPI，只影响从源码部署 main 的人。
+
+  新增 `tests/bigqmt_signal_trader/test_async_batch_swallows_orders.py`，下单/批量放在文件最前面 —— 这里答错要花真钱，别的用例都没有这个性质。10 例里 5 例在修复前是红的（`git stash` 验证过）。#181 原有的批量测试从来测不到这个：它的 `_order_kwargs` 每笔都带 remark，还把 `order_stock_batch` 整个打了桩，服务端处理器根本没被跑到。
+
+- **策略名一直就在回调里，读错字段了**（#174，@sumo225270 提供 raw_fields）：#174 此前的结论是「大 QMT 的委托/成交行不带策略名，只能靠下单时记、回调时反查」。那是从一个**正确的观察**得出的**错误结论** —— `m_strStrategyName` 确实不存在（实盘列全部属性：ORDER 120 个、DEAL 47 个，两边都没有），但名字在 `m_strSource`（**报单来源**）里，就是 `passorder` 第 8 个参数 `strategyName` 原样回来。
+
+  仓库自己早就记着这件事，只是从来没读回来：`docs/MiniQMT_2_BigQMT-Skill/api_mapping.md` 里 `order.strategy_name` 就映射到 `o.m_strSource`；#154 更是在实盘量过 —— 手工下的 13 行 `m_strSource` 为空，本桥下的 3 行带着策略名，而 `m_strStrategyName` 16 行全空。`rpc_default_strategy_name` 这个配置项存在的理由就是它会显示在 QMT 的报单来源列里。
+
+  报告人的 dump 里，委托和成交回调**都**带着 `m_strSource: '大QMT桥接器'`。所以本桥下的单现在**在回调里就能自报家门**，不需要 Redis、不需要进程内 journal、也不需要按 remark 对键 —— 顺带覆盖了那三者都覆盖不了的情况：本进程启动**之前**下的单。
+
+  四处一起改，回调路径和查询路径用同一份候选字段表，免得同一笔单在事件里和在查询结果里说法不一：`normalize_order_event`、`normalize_trade_event`、以及 `order_bigqmt` 的委托/成交两个构造器。
+
+  取值改成**取第一个非空**而不是第一个非 None：`_attr` 遇到 `""` 就停（空串不是 None），终端只要把 `m_strStrategyName` 建成空串，就会挡住后面的 `m_strSource`，答一个「无名」而名字明明在对象上。
+
+  身份补全（journal → Redis）保留作兜底，覆盖行本身答不了的：终端不填报单来源的情况，以及只有桥接器知道名字的单。
+
+  **顺带澄清 #174 的两条旧怀疑，都不成立**：`m_strRemark` **没有被截断**（报告人下单原串、委托回调、成交回调三处都是 len=50，逐字一致）；那台终端的 **Redis 是通的**（846 条委托事件、738 条成交事件都进了 db5）。
+
+  **未验证**：本机当日 14 笔委托 / 17 笔成交全是手工单，只读探针测到 `m_strSource` 在这些行上**全为空** —— 这只证到了负面对照（手工单不会被安上策略名），证不到「本桥下的单在这台终端上能端到端带回策略名」。那要开盘时经由本桥真下一单，本任务不下单。正面证据来自 #154 的实盘测量和报告人的 dump。
+
+- **MiniQMT 历史数据语义与纯 ZMQ 交易回调不再意外缩水**：客户端本地缓存填充时保留 MiniQMT K 线字段中的 `time` / `openInterest`，并默认允许“下载原始数据后按另一复权方式读取”时回源 Big QMT；缓存同时存在日期索引和毫秒 `time` 列时，优先用日期索引做窗口过滤。这些都是 MiniQMT 可观察行为，不绑定某个上层框架。
+
+  纯 ZMQ 入口不再强制关闭 `exec_events`：现有 ZMQ PUB 通道可承载 `on_stock_order` / `on_stock_trade` / `on_order_error` MiniQMT 风格回调。仍无 Redis Stream 的短时回放，且 `download_jobs` / `full_tick_cache` 依然在纯 ZMQ 入口中关闭。
 
 - **`qmt.py trades` 现在带上 `strategy_name`**（#174 的后续，客户端工具）：#174 给的绕行办法是「回调拿不到策略名时用查询兜一下」—— 查询路径确实是补全过的（`_attribute_to_strategies`），可照着这个办法用本仓库自己的 CLI 去查成交的人，看到的是查询路径**也**没有策略名。
 
@@ -15,6 +137,13 @@
 
   **未验证**：这台终端当日 17 笔成交全部是手工单（备注为空），所以实盘只能证到**键在、值为空**，证不到「本桥下的单能查回非空策略名」—— 那要开盘时经由本桥下一单才看得到，而本任务不下单。
 
+- **`order_stock_batch` 的应答不再被其中一笔的结算扣住**（#181 顺带点名的隐患，服务端）：`_handle_submit_orders_batch` 把每个 item 原样交给 `_handle_submit_order`，而后者的 `wait_settlement` 默认 `True`，结算又只有**一个单槽**（`_pending_settlement`），服务层每个请求只 `take` 一次。于是批里的 N 笔逐笔覆盖，只有最后一笔活下来。
+
+  **不丢单**（每一笔都提交出去了），丢的是别的三样：整批应答被推迟到那一笔结算完或超时才发出（批量存在的理由就是一次往返，这等于把最贵的一笔的延迟加回来）；那一笔的诊断挂到整批头上 —— 离线复现出来的原文是 `passorder submitted but order not found in system (stock=600000.SH action=BUY price=10.10 volume=100, 1 lookup(s))`，一个说的是**一笔**的消息，挂在覆盖**两笔**的应答上；而它回填的 `order_sys_id` 谁也读不到 —— 批量结果 dict 在结算之前就已经从 result 上拷完了。
+
+  批量处理器现在对每一项显式置 `wait_settlement=False`。不损失什么：批量应答本来就是逐项的（每项带 `index` / `order_sys_id` / `user_order_id`），委托号照样从 `order_callback` 推送学得到，和 `order_stock_async` 一样（#50）。要真按项支持 `wait_settlement`，得把单槽改成挂在一次应答上的结算队列，那是 #181 的另一半。
+
+  **未验证**：这是服务端改动，要部署 + 重启策略才生效，本任务不部署也不下单，所以实盘只证到桥接服务健康（只读门禁 10 项全过），证不到「真发一批委托时应答立刻回来」。离线侧四条用例覆盖：批量不留结算、应答不被扣住、单笔诊断不外溢，以及**单笔 `order_stock` 仍然照常等结算**（负面对照，#44/#152 的机制没被这次改动碰到）。
 
 ## [0.3.20] - 2026-09-04
 

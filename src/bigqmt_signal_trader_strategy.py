@@ -567,14 +567,28 @@ def _is_redis_transport(transport_name):
 def _resolve_background_threads(transport_name, configured):
     """Decide whether the RPC service runs its own background receive threads.
 
-    Redis honors the configured value because it has a blocking brpop path AND
-    an adjust-driven lpop drain. ZMQ and all other transports MUST run their
-    receiver threads — without the background router loop, requests are never
-    received (ZMQ's start_receiving(background_threads=False) only binds the
-    socket and does not poll it).
+    ``configured`` is None when the local config never set
+    ``rpc_background_threads`` (the runtime only forwards the key when it was
+    given explicitly) -- that case keeps the historical default: background
+    receiver threads on for every transport.
+
+    An explicit False opts into the adjust-driven drain instead: the transport
+    is polled with a non-blocking recv from drain_request_queue on each adjust
+    tick, and the reply is sent on the adjust thread too. That removes every
+    cross-thread handoff from the round trip -- measured on the live terminal,
+    each time a background thread acquires the GIL costs ~1 adjust tick
+    (~100ms), which is where the round trip actually goes (#104).
+
+    Only zmq/mysql implement drain_request_queue, so only they honor the
+    override; anything else keeps the receiver thread it needs to be polled by.
+    Redis honors either value (blocking brpop path AND an adjust lpop drain).
     """
     normalized = str(transport_name or "redis").lower()
     if _is_redis_transport(normalized):
+        return bool(configured)
+    if configured is None:
+        return True
+    if normalized in ("zmq", "mysql"):
         return bool(configured)
     return True
 
@@ -744,7 +758,11 @@ def _build_rpc_service(context_info, app, config):
     handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
-    configured_bg = _config_bool(rpc_config.get("background_threads"), False)
+    # None when the runtime did not forward the key (local config never set
+    # rpc_background_threads): the resolver then keeps the historical default.
+    configured_bg = rpc_config.get("background_threads")
+    if configured_bg is not None:
+        configured_bg = _config_bool(configured_bg, False)
     background_threads = _resolve_background_threads(transport_name, configured_bg)
     if background_threads and not configured_bg:
         print("[bigqmt_rpc] transport=%s -> background_threads auto-enabled" % transport_name)
@@ -1705,9 +1723,15 @@ def _local_identity_strategy_name(account_id, event):
 def _enrich_event_identity(exec_events, config, account_id, event):
     """Put the strategy name back on an event QMT could not name (#174).
 
-    Big QMT does not carry it on order or deal objects -- 120 and 47
-    attributes on a live terminal, m_strStrategyName in neither -- so what the
-    bridge remembered at submit time is the only way back.
+    Most events no longer get here: normalize_*_event reads the name off
+    报单来源 (m_strSource), which is passorder's own strategyName argument
+    coming back, so an order this bridge placed names itself and returns at the
+    first line below. m_strStrategyName really is absent (120 and 47 attributes
+    on a live terminal, in neither) -- concluding from that alone that the name
+    was absent too is what made this function the only way back.
+
+    It stays as the fallback for what the row cannot answer: a terminal that
+    blanks the source, and orders whose name only the bridge ever knew.
 
     The in-process journal is consulted FIRST, and deliberately so. This runs
     on QMT's C++ callback thread, and for an order this process submitted the
