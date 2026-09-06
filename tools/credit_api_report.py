@@ -383,6 +383,17 @@ def render_text(report):
             add("  这台终端没有绑上的全局函数: %s" % ", ".join(missing))
     add("")
 
+    callback = (report.get("probe") or {}).get("credit_callback") or {}
+    if callback:
+        add("-" * 72)
+        add("信用账户回调（查柜台那条路）")
+        add("-" * 72)
+        add("  note_credit_account 可用 : %s" % callback.get("note_credit_account_available"))
+        add("  QMT 实际回调次数         : %s   (0 = QMT 压根没回调)"
+            % callback.get("callbacks_seen"))
+        add("  桥里缓存的行数           : %s" % callback.get("cached_rows"))
+        add("")
+
     routing = (report.get("probe") or {}).get("thread_routing") or {}
     if routing.get("available"):
         add("-" * 72)
@@ -439,6 +450,20 @@ def build_conclusions(report):
     # probe 的 global_namespace 走的是策略侧 _resolve_runtime_name 同一条解析
     # 路径（qmt_api -> globals -> builtins），所以它能分开这两种。
     counter_entry = by_method.get("query_credit_account", {})
+    counter_env = counter_entry.get("envelope") or {}
+    if counter_env.get("query_issued") and not counter_env.get("fresh"):
+        seen = counter_env.get("callbacks_seen")
+        waited = counter_env.get("waited_seconds")
+        if seen == 0:
+            out.append("query_credit_account 发出去了，但 QMT 一次回调都没给"
+                       "（callbacks_seen=0，等了 %s 秒）。可能是等太短、这个账户"
+                       "柜台不答，或者 credit_account_callback 没挂到被挂载的"
+                       "入口文件上 —— 加大 --wait 再跑一次，仍是 0 就把这份报告"
+                       "贴上来。" % waited)
+        elif seen:
+            out.append("query_credit_account 的回调**来过 %s 次**，但这次没等到"
+                       "新结果 —— 回调链路是通的，问题在时序或限流，不在绑定。"
+                       % seen)
     if (counter_entry.get("envelope") or {}).get("callback_bound") is False:
         in_namespace = ((report.get("probe") or {}).get("global_namespace")
                         or {}).get("query_credit_account")
@@ -500,8 +525,8 @@ def main(argv=None):
     parser.add_argument("--out", default=".", help="报告输出目录")
     parser.add_argument("--full", action="store_true",
                         help="报告里带上原始数值（默认省略，便于直接贴 issue）")
-    parser.add_argument("--wait", type=float, default=3.0,
-                        help="查柜台那条路等回调的秒数（默认 3）")
+    parser.add_argument("--wait", type=float, default=8.0,
+                        help="查柜台那条路等回调的秒数（默认 8）。查柜台可能比几秒还慢，而这是只读查询，等久一点没有代价")
     args = parser.parse_args(argv)
 
     from bigqmt_signal_trader.xtquant_compat import XtQuantTrader

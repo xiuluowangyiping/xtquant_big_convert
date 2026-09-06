@@ -131,6 +131,9 @@ _account_id = ""
 _config = {}
 _qmt_api = {}
 _adjust_logged = False
+# QMT 调了多少次 credit_account_callback。0 说明 QMT 压根没回调，
+# 大于 0 但 handlers 里没数据说明是转交那一步断了（#202）。
+_credit_callback_fired = 0
 _rpc_service = None
 _quote_subscription_service = None  # (QuoteSubscriptionManager, QuotePushChannel)
 _exec_event_redis_client = None  # reused; building a new client per trade callback leaks
@@ -1871,9 +1874,27 @@ def credit_account_callback(ContextInfo, seq, result):
     主线程上下文的事，也绝不让异常逃出去 —— 回调里抛异常在 QMT 那边表现为没有
     堆栈的 SystemError（issue #76）。
     """
+    # 这里以前成功和失败都不出声，于是「QMT 根本没回调」和「回调来了但没送到
+    # handlers」从外面看一模一样 —— 正是 CLAUDE.md 里那条「a failed operation
+    # looks exactly like one that never ran」，栽在自己的新代码上。所以每一次
+    # 触发都留痕：计数交给 handlers（probe_capabilities 报出来），送不到时
+    # 一定要吼出来。
+    global _credit_callback_fired
+    _credit_callback_fired += 1
     try:
         handlers = getattr(_rpc_service, "handlers", None) if _rpc_service else None
-        if handlers is None or not hasattr(handlers, "note_credit_account"):
+        if handlers is None:
+            _log_err("credit_account_callback",
+                     "QMT delivered a credit account detail (seq=%s) but there is "
+                     "no RPC service to hand it to -- the answer is being dropped."
+                     % (seq,))
+            return False
+        if not hasattr(handlers, "note_credit_account"):
+            _log_err("credit_account_callback",
+                     "QMT delivered a credit account detail (seq=%s) but this "
+                     "deployment's handlers have no note_credit_account -- the "
+                     "bridge package is older than the entry file. Re-sync and "
+                     "restart." % (seq,))
             return False
         return handlers.note_credit_account(seq, result)
     except Exception as exc:

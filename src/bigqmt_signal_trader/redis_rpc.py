@@ -590,6 +590,9 @@ class BigQmtRpcHandlers:
         self._credit_account_asked = 0.0      # 上一次真的发出查询的时间
         self._credit_account_inflight = False
         self._credit_account_error = ""
+        # QMT 实际回调了多少次。0 = QMT 没回调；>0 但没数据 = 回调来了但结果
+        # 没落进来。两者的排查方向完全不同，从外面看却一样（#202）。
+        self._credit_account_callbacks = 0
         self.credit_account_min_interval_seconds = CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS
         self.credit_account_max_wait_seconds = CREDIT_ACCOUNT_MAX_WAIT_SECONDS
         if allowed_methods is None:
@@ -815,6 +818,11 @@ class BigQmtRpcHandlers:
         # 3 = 信用。#201 的报告只看到「空列表」，无从判断是哪一种。
         info["credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"] = \
             self._probe_credit_account_object()
+        info["credit_callback"] = {
+            "note_credit_account_available": hasattr(self, "note_credit_account"),
+            "callbacks_seen": getattr(self, "_credit_account_callbacks", 0),
+            "cached_rows": len(getattr(self, "_credit_account_rows", []) or []),
+        }
         info["thread_routing"] = self._probe_thread_routing()
         info["sector_probe"] = self._probe_sector_channels()
         info["order_watch"] = self._probe_order_watch()
@@ -836,10 +844,12 @@ class BigQmtRpcHandlers:
             rows = _normalize_detail_rows([result] if result is not None else [])
         except Exception as exc:
             with self._credit_account_lock:
+                self._credit_account_callbacks += 1
                 self._credit_account_inflight = False
                 self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
             return False
         with self._credit_account_lock:
+            self._credit_account_callbacks += 1
             self._credit_account_rows = rows
             self._credit_account_stamp = time.time()
             self._credit_account_inflight = False
@@ -909,11 +919,13 @@ class BigQmtRpcHandlers:
                     break
             # sleep 让出 GIL，回调线程才拿得到 —— busy-wait 会把它锁死在门外。
             time.sleep(0.02)
+        waited = round(time.time() - (deadline - wait_seconds), 3)
         with self._credit_account_lock:
             rows = list(self._credit_account_rows)
             stamp = self._credit_account_stamp
             error = self._credit_account_error
             seq = self._credit_account_seq
+            callbacks = self._credit_account_callbacks
         return {
             "rows": rows,
             "count": len(rows),
@@ -925,6 +937,10 @@ class BigQmtRpcHandlers:
             "seq": seq,
             "error": error,
             "callback_bound": callable(self.qmt_api.get("query_credit_account")),
+            # 这两个才是能定位问题的：callbacks_seen=0 说明 QMT 压根没回调
+            # （等太短？账户不支持？回调没挂上？），>0 说明回调通了、问题在别处。
+            "callbacks_seen": callbacks,
+            "waited_seconds": waited,
         }
 
     def _describe_probe_rows(self, rows):

@@ -194,6 +194,53 @@ class QueryCreditAccountTest(unittest.TestCase):
         result = handlers.note_credit_account(1, _Exploding())
         self.assertIn(result, (True, False))
 
+    def test_envelope_counts_callbacks_so_silence_is_diagnosable(self):
+        """callbacks_seen=0 和 >0 指向完全不同的排查方向，必须报出来。
+
+        实盘上出现过：绑定修好了、query_issued=true，但 fresh=false 没数据。
+        光看这些分不清「QMT 压根没回调」和「回调来了但结果没落进来」。
+        """
+        handlers_box = {}
+
+        def query_credit_account(account_id, seq, context_info):
+            handlers_box["h"].note_credit_account(seq, _CreditResult())
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+
+        before = handlers.handle("probe_capabilities", {})["credit_callback"]
+        self.assertEqual(before["callbacks_seen"], 0)
+        self.assertTrue(before["note_credit_account_available"])
+
+        out = handlers.handle("query_credit_account", {})
+        self.assertEqual(out["callbacks_seen"], 1)
+        self.assertIsInstance(out["waited_seconds"], float)
+
+        after = handlers.handle("probe_capabilities", {})["credit_callback"]
+        self.assertEqual(after["callbacks_seen"], 1)
+        self.assertEqual(after["cached_rows"], 1)
+
+    def test_a_query_that_never_calls_back_reports_zero_callbacks(self):
+        out = _handlers(lambda *a: None).handle(
+            "query_credit_account", {"wait_seconds": 0.1})
+
+        self.assertTrue(out["query_issued"])
+        self.assertFalse(out["fresh"])
+        self.assertEqual(out["callbacks_seen"], 0)      # QMT 没回调
+        self.assertGreaterEqual(out["waited_seconds"], 0.05)
+
+    def test_a_callback_that_cannot_be_normalised_still_counts(self):
+        """回调来过就要记一笔 —— 哪怕结果没能用上，那也不是「没回调」。"""
+        class _Exploding(object):
+            @property
+            def m_dTotalDebt(self):
+                raise RuntimeError("boom")
+
+        handlers = _handlers(lambda *a: None)
+        handlers.note_credit_account(1, _Exploding())
+        probe = handlers.handle("probe_capabilities", {})["credit_callback"]
+        self.assertGreaterEqual(probe["callbacks_seen"], 1)
+
     def test_method_is_whitelisted_and_deferred_to_the_main_thread(self):
         from bigqmt_signal_trader.redis_rpc import (
             LISTENER_DEFERRED_METHODS, READ_METHODS,

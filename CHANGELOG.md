@@ -15,6 +15,10 @@
 
 ### 修复
 
+- **信用账户回调的成功与失败都不出声，「QMT 没回调」和「回调来了没送到」分不开**（#202 后续）：入口捕获修好后，实盘上出现 `callback_bound: true`、`query_issued: true`，但 `fresh: false` 没数据。而 `credit_account_callback` 无论成功还是失败都静默返回 —— 又是「a failed operation looks exactly like one that never ran」，这次栽在自己的新代码上。
+
+  现在每次回调都留痕：handlers 记 `callbacks_seen` 计数；转交不成功时（没有 RPC service、handlers 太旧没有 `note_credit_account`）**大声报出来**而不是默默 `return False`；归一化失败也照样计数 —— 回调来过就是来过，不能算成「没回调」。`query_credit_account` 的信封新增 `callbacks_seen` 和 `waited_seconds`，`probe_capabilities` 新增 `credit_callback` 一段（不发查询也能看）。体检报告把这两种成因分开写进结论，并把默认等待从 3 秒放宽到 8 秒（查柜台可能更慢，而这是只读查询，等久一点没有代价）。
+
 - **入口文件手抄的 QMT 全局函数名单漏了 `query_credit_account`，桥拿不到它，却被误报成「这台终端没有这个函数」**（#202 后续）：QMT 只往**被挂载的那个文件**的命名空间注入全局函数，所以捕获必须在入口文件里做。策略模块的 `_QMT_INJECTED_GLOBAL_FUNCS` 是这份名单的唯一来源，它自己的注释就写着「do not hand-copy the names elsewhere」—— 而 `BIGQMT_REDIS_DRYRUN.py` 里偏偏有一张手抄表。给策略模块加 `query_credit_account` 时漏了它，于是桥捕获不到 → `probe_capabilities` 报 `callback_bound=false` → 报告据此下结论「这台终端没有 query_credit_account，重启也没用」。
 
   **而用户在大 QMT 里直接调它是好用的**（维持担保比例 3.35、总负债 1038962.07）。一个桥的 bug 被报成了券商终端的能力缺失 —— 这比返回空更糟，它给出的是一个错误但听起来很确定的结论，会让人不去查真正的地方。
