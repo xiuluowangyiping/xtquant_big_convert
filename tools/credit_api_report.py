@@ -443,12 +443,21 @@ def build_conclusions(report):
         in_namespace = ((report.get("probe") or {}).get("global_namespace")
                         or {}).get("query_credit_account")
         if in_namespace is False:
-            out.append("这台终端没有 query_credit_account 这个全局函数（QMT 没注入），"
-                       "查柜台那条路在这台机器上不可用 —— 用同步的 "
-                       "query_credit_detail。重启策略也解决不了。")
+            # 曾经这里断言「这台终端没有这个函数」。那个结论是错的：真实原因是
+            # 入口文件里一张手抄的函数名清单漏了它，桥自己没捕获到，而用户在
+            # 大 QMT 里直接调是好用的。一个桥的 bug 被报成了券商终端的能力
+            # 缺失 —— 错误但听起来很确定的结论，比不给结论更坏（#202）。
+            out.append("query_credit_account 没绑上。有两种可能，从这里分不开："
+                       "(a) 桥没捕获到它 —— 确认入口文件用的是 "
+                       "capture_qmt_injected_funcs，并且**真的重启过策略**"
+                       "（入口文件 reload_deployment() 刷不了）；"
+                       "(b) 这台终端确实没有这个函数。"
+                       "**先在大 QMT 里直接调一次 query_credit_account 试试**，"
+                       "能调通就是 (a)。同步的 query_credit_detail 不受影响。")
         else:
-            out.append("query_credit_account 没绑上，多半是部署了但没**重启策略**"
-                       "（入口文件 reload_deployment() 刷不了）。不影响同步那条。")
+            out.append("query_credit_account 在命名空间里但没绑上，多半是部署了"
+                       "没**重启策略**（入口文件 reload_deployment() 刷不了）。"
+                       "不影响同步那条。")
 
     cached = by_method.get("query_credit_detail", {})
     counter = by_method.get("query_credit_account", {})
