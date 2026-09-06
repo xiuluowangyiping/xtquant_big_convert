@@ -7,6 +7,16 @@
 
 ### 修复
 
+- **三个 QMT 全局函数的参数写错，外加两个返回形状用错，全部静默返回空**（#207）：QMT 全局函数的映射是纯手写的，没有任何东西校验它和官方签名对不对。用 AST 把所有调用点扫出来和官方参考比对，查出：`get_value_by_order_id` 只传了 1 个参数（签名要 4 个）、`get_last_order_id` 只传了 1 个（要 3-4 个）、`get_history_trade_detail_data` 传了 4 个且把 `detail_type` 塞到了 `strAccountType` 的位置（要 5 个，和 #96 同一个形状）。全部被 `_call_qmt_global` 的 `except: return []` 吞掉。
+
+  参数修好后实盘一跑，又暴露出返回形状也用错了：`get_last_order_id` 返回的是**委托号字符串**，不是行列表，`_normalize_detail_rows` 会去迭代它 —— 真委托号 `'635005110'` 变成 **9 个空 dict**（一个字符一个），QMT 表示「没找到」的 `'-1'` 变成 2 个空 dict，int 直接抛 TypeError 被吞成 `[]`。**委托号被完全销毁**，而这个函数正是官方「下单 → 查单 → 撤单」标准流程的第二步。`get_value_by_order_id` 同理，它返回**单个**委托对象不是列表，迭代它抛异常同样被吞成 `[]`，看起来像「查不到这笔委托」。新增 `_call_qmt_scalar`（保留标量原样）和 `_call_qmt_object`（单对象归一化）两条取数路径。
+
+  顺带：`_normalize_detail_rows` 丢掉非标识符的属性名。QMT 委托对象上除了 60 个 `m_*` 字段还挂着 60 个数字串名的枚举常量（`'0': 48` / `'-1': -1`），`dir()` 一并刮走让载荷翻倍。实盘实测 120 字段 → 65 字段，真字段一个不少。
+
+  **同时加了一道机械闸**：`tests/bigqmt_signal_trader/test_qmt_global_arity.py` 用 AST 扫出所有 `_call_qmt_*` 调用点，和一张按官方参考手抄的签名表比对，写错参数个数从此是「测试红」而不是「线上静默返回空」；新接一个全局函数不登记签名也会红，防止这道闸慢慢失效。这一个 session 里同形态的 bug 出现了六次（#96 / #201 / #205 / #207 三条），值得一道闸。
+
+  实盘验证（只读）：`get_last_order_id` 从 `[{}, {}]` 变成 `'-1'`；`get_value_by_order_id(635005110)` 从 `[]` 变成 65 个字段的委托对象，`m_strOrderSysID=635005110`、`m_nOrderStatus=56`。`get_history_trade_detail_data` 在本机终端未绑定，未验证。
+
 - **直连的两融 `get_*` 查询恒返回空，而调同一个 QMT 函数的 `query_*` 孪生方法有数据**：一位有两融账户的用户跑 `tools/credit_api_report.py` 回报，同一次运行里 `query_stk_compacts` 52 行 / `query_credit_subjects` 71002 行 / `query_credit_slo_code` 50 行，而 `get_unclosed_compacts` / `get_assure_contract` / `get_enable_short_contract` 全是 0 行。两边的 handler **逐字节相同**，账号相同，底层 QMT 函数也是同一个 —— 唯一的差别是 `query_*` 在 `LISTENER_DEFERRED_METHODS` 里（走 adjust 主线程），直连的不在（走后台 listener 线程）。
 
   这正是 `get_ipo_data` 早就踩过并修掉的坑，它的注释原文就是「交易类查询, 需主线程上下文（后台线程返回空）」—— 当时只修了它一个，孪生方法漏网。现在把所有要交易上下文的 QMT 全局函数补进 defer 名单：`get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` / `get_closed_compacts` / `get_debt_contract` / `get_option_subject_position` / `get_comb_option` / `get_new_purchase_limit` / `get_hkt_exchange_rate`。行情读（`get_ticks` / `get_market_data*` / `get_option_list` / `get_main_contract` …）保持 inline 不动，defer 会白搭上一个 adjust 间隔的延迟；用例同时钉住这两侧。
