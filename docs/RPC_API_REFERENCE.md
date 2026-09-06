@@ -329,7 +329,29 @@
 | `get_comb_option` | `account_id`(可选) | 组合期权 |
 | `get_hkt_exchange_rate` | 无 | 港股通汇率 |
 
-> **融资融券查询的正确方式**：官方文档明确 `get_trade_detail_data` 的合法 `strDatatype` 只有 6 个（`ACCOUNT`/`POSITION`/`POSITION_STATISTICS`/`ORDER`/`DEAL`/`TASK`）。两融查询必须用上述独立函数，不要传 `"CREDIT"` 等字符串。
+> **融资融券查询的正确方式**：`get_trade_detail_data(accountID, strAccountType, strDatatype, strategyName)` 有**两个轴**，别混在一起：
+>
+> - **`strDatatype`（查什么数据）** 只有 6 个合法值：`ACCOUNT` / `POSITION` / `POSITION_STATISTICS` / `ORDER` / `DEAL` / `TASK`。**别往这里传 `"CREDIT"`** —— 负债合约、担保标的、可融券这些要用上表的独立函数。
+> - **`strAccountType`（查哪本账）** 才是填 `'CREDIT'` 的地方。官方 `strDatatype` 说明里写着 `ACCOUNT：账号对象**或信用账号对象**` —— 所以信用账户明细就是 `get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')`，返回 `CCreditAccountDetail`。`query_credit_detail` 走的正是这条（#201 之前它错调了已弃用的 `get_debt_contract`，两融账户因此恒为空）。
+>
+> **信用账户明细有两份，字段名还不一样**：
+>
+> | | RPC | 大 QMT | 对象 | 特点 |
+> |---|---|---|---|---|
+> | 终端缓存 | `query_credit_detail` | `get_trade_detail_data(accId,'CREDIT','ACCOUNT')` | `CCreditAccountDetail`（3.14，**非查柜台**）| 同步、无限流；券商没推就是空的 |
+> | 查柜台 | `query_credit_account` | `query_credit_account` + `credit_account_callback` | `CCreditDetail`（3.15）| 异步、权威；官方建议 30s 一次 |
+>
+> 总负债在缓存那份叫 `m_dTotalDebit`，在柜台那份叫 `m_dTotalDebt` —— 只差一个字母，别看错。
+
+### `query_credit_account`
+- **参数**：`account_id`(可选) `wait_seconds`(可选，默认 1.5，上限 10)
+- **返回**：`{"rows": [...], "count": n, "query_issued": bool, "not_issued_reason": str, "fresh": bool, "stale": bool, "age_seconds": float|null, "seq": int, "error": str, "callback_bound": bool}`
+- **为什么不是裸列表**：大 QMT 那边 `query_credit_account(accId, seq, ContextInfo)` 立刻返回，结果只从 `credit_account_callback` 出来。桥替你发查询、等回调、缓存结果，所以这条 RPC 本身是同步的 —— 但**空列表有好几种成因**（没绑上 / 被限流 / 发了没等到回调 / 真没数据），只回一个 `[]` 分不开。看 `query_issued`、`fresh`、`callback_bound`，别只看 `rows`。
+- **限流**：官方参考 6.13 写明「只能有一个查询」「建议 30s 一次，不可频繁调用」。桥按 30 秒最小间隔挡住过密的查询，直接返回上一次的结果并标 `stale=true`，不会替你去打柜台。
+- **需要重启策略**：`credit_account_callback` 定义在入口文件命名空间里（QMT 只往被挂载的那个文件回调），而入口文件 `reload_deployment()` 刷不了。`callback_bound=false` 通常就是「部署了但没重启」。
+- **客户端**：`xt_trader.query_credit_account(account, wait_seconds=None)`
+
+> **体检工具**：`python tools/credit_api_report.py` 把上面每个两融接口都只读调一遍，导出一份可以直接贴到 issue 的报告（账号打码、金额不带原值、持仓代码不进报告）。维护者没有两融账户，两融那一片只能靠有两融账户的用户跑一次回报。
 
 ---
 
