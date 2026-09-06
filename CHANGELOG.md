@@ -3,6 +3,42 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [未发布]
+
+### 修复
+
+- **两融账户调 `query_credit_detail` 恒为空列表**（#201）：handler 把它路由到了 `get_debt_contract`。两处都不对 —— 那是「负债合约明细」（一张张合约），不是信用账户对象；而且官方参考 6.17 已把它标记【已弃用】。于是没有未了结负债的两融账户必然拿到 `[]`，有负债的也只拿到合约行，永远拿不到维持担保比例 / 授信额度那一组字段。
+
+  改走 `get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')` → `CCreditAccountDetail`（官方参考 3.14），也就是本仓 `docs/MiniQMT_2_BigQMT-Skill/api_mapping.md:83` 一直记着、而代码一直没对上的那条映射。账户类型强制 `CREDIT`，不跟部署配置走：账户类型是「问哪本账」，不是「这台部署下单用哪本账」，否则按 `STOCK` 配置的部署永远查不到自己的信用账户。
+
+  顺带修了 `probe_capabilities` 自己的一个坑：它统一用单参数调那四个信用全局函数，而 `get_unclosed_compacts` / `get_closed_compacts` 是两参数签名 `(accountID, accountType)`，实盘上撞 boost::python 的 `ArgumentError` —— **把一个好用的接口报成坏的**，排查时反而在误导人。另外新增 `get_trade_detail_data(CREDIT,ACCOUNT)` 探测项，报 `m_nBrokerType`（3=信用）和信用专有字段是否到位：空列表有「这本账户不是信用账户」和「这台终端读不到」两种成因，原来的裸 `[]` 分不开。
+
+### 新增
+
+- **信用账户「查柜台」通道 `query_credit_account`（备用，一般用不上）**（#202）：大 QMT 里信用账户明细有两个来源。上面 #201 修好的同步那条读终端缓存（`CCreditAccountDetail`，官方参考 3.14），**这是默认路径，维护者实测可用**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 直接取得到，返回 list 取 `[0]`，大小写不敏感。
+
+  异步那条 `query_credit_account(accId, seq, ContextInfo)` 查柜台，结果只从 `credit_account_callback` 出来，本桥此前完全没接过这个回调。现在接上，但**定位是备用**：3.14 那份官方标注「非查柜台」，是终端本地缓存，万一换一家券商的终端不填它，那就只剩查柜台这一条路 —— 而这正是维护者这边验证不了的一类问题。不需要的话完全不用理会，不调它就什么都不会发生。
+
+  两条路互不依赖：`query_credit_detail` 不会在空的时候偷偷退到 `query_credit_account`，也不共享状态。返回对象也不同，**总负债在缓存那份叫 `m_dTotalDebit`、柜台那份叫 `m_dTotalDebt`**，融资/融券负债细分只有柜台那份有，不能混着读。名字容易误导：`query_credit_account` 不是 `query_credit_detail` 的异步版本，两个名字来自两套命名体系（前者是大 QMT 原生全局函数名，后者是 MiniQMT 客户端 API 名）。
+
+  实现要点：`credit_account_callback` 在策略模块定义、每个入口文件再导出一次（QMT 只往被挂载的那个文件回调，同 `order_callback`；两个单文件构建器各自硬编码的清单也补上了，并有用例钉住不许漏）。官方参考 6.13 的限流（「只能有一个查询」「建议 30s 一次」）由桥自己挡，客户端怎么轮询都打不爆柜台；等不到回调就返回上一次的值并标 `stale=true`，不把陈数据冒充新的。响应里 `query_issued` / `fresh` / `callback_bound` / `not_issued_reason` 把「空」的几种成因分开报。
+
+  **入口文件 `reload_deployment()` 刷不了，这条需要真的重启策略**；没重启时 `callback_bound=false`，不影响同步那条。
+
+- **两融 API 只读体检报告 `tools/credit_api_report.py`**：把每个两融接口真调一遍，记下大 QMT 实际返回了什么（行数、字段名、字段有没有值），导出 `.txt` + `.json` 报告。**不下单、不撤单**（用例钉住了清单里不含任何写方法）。默认脱敏，报告可以直接贴到公开 issue：账号打码、金额只记「有值 / 全 0」、`get_positions` 的键是股票代码所以整组打掉；`m_nBrokerType` 例外，保留原值 —— 打了码就没法判断是不是信用账户了。报告带对照组（非两融接口），先回答「是桥不通还是两融接口的问题」，再下结论。
+
+  维护者没有两融账户，两融那一整片只能靠有两融账户的用户跑一次回报 —— 这个工具就是为了把「盲猜」换成「照着报告看」。
+
+### 已知限制
+
+- **#201 的取数路径经维护者实测确认**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里能取到信用账户信息。但**这个仓的 RPC 链路本身没有在真实两融账户上跑过** —— 维护者的部署账户是普通股票账户（`m_nBrokerType=2`），信用账本不存在，所有两融接口返回空都是正确行为，证明不了这条链路端到端通。
+
+- **#202 的异步通道在维护者的终端上根本不可用，也就无从验证**，且默认不需要它。重启策略后 `callback_bound` 仍是 `false`：`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` 都经同一条 `_resolve_runtime_name`（qmt_api → globals → builtins）解析得到，唯独 `query_credit_account` 解析不到 —— **这台国金 QMT 没有注入这个全局函数**，重启解决不了。这反过来说明同步那条不只是「够用」，在这类终端上是**唯一**的路。`probe_capabilities` 新增的 `global_namespace["query_credit_account"]` 能把「终端没有」和「有但没重启」分开，体检报告会直接说是哪一种。
+
+- 已验证的部分：全量测试 1631 passed（收集数 == 文件数）、#201 用例修复前 4 red / 修复后 green、实盘上 `probe_capabilities` 的 `ArgumentError` 已消失、新增探测项能答、体检工具端到端跑通并正确判定「这不是信用账户」、两个单文件构建器重新生成后都带上了回调且 no-redis 那份仍 GBK 可解析。
+
+- **欢迎有两融账户的用户跑 `tools/credit_api_report.py` 并把报告贴到 #201 / #202。**
+
 ## [0.3.23] - 2026-09-06
 
 ### 修复

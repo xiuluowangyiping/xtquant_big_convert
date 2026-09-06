@@ -86,6 +86,7 @@ READ_METHODS = {
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
+    "query_credit_account",
     "query_stk_compacts",
     "query_credit_subjects",
     "query_credit_slo_code",
@@ -148,6 +149,7 @@ LISTENER_DEFERRED_METHODS = {
     "query_account_infos",
     "query_account_status",
     "query_credit_detail",
+    "query_credit_account",
     "query_stk_compacts",
     "query_credit_subjects",
     "query_credit_slo_code",
@@ -203,6 +205,16 @@ CANCELED_ORDER_STATUSES = {"53", "54"}
 # strategy_name=, or once with rpc_default_strategy_name in the config;
 # "" leaves the column blank the way a hand-placed order does.
 DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
+# query_credit_account 是查柜台的，官方参考 6.13 原话：「本函数只能有一个查询，
+# 如果前面的查询正在进行中，后面的查询将会提前返回。本函数从服务器查询数据，
+# 建议平均查询时间间隔 30s 一次，不可频繁调用。」所以桥这边自己限流，客户端
+# 想怎么轮询都不会把柜台打爆（#202）。
+CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS = 30.0
+# 一次 RPC 里最多等回调多久。回调走 QMT 的 C++ 线程，handler 在 adjust 主线程
+# 上；这里的等待用 sleep 轮询让出 GIL，回调才落得下来。默认给得短，因为拿不到
+# 新的就退回上一次的缓存值，不必把主线程按住。
+CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS = 1.5
+CREDIT_ACCOUNT_MAX_WAIT_SECONDS = 10.0
 TERMINAL_NON_CANCEL_ORDER_STATUSES = {"56", "57"}
 # 51 已报待撤 / 52 部成待撤: the exchange has ACCEPTED the cancel and it is
 # on its way. Neither cancelled nor failed -- keep waiting, and at the
@@ -545,6 +557,19 @@ class BigQmtRpcHandlers:
         # Server-side diagnostic for silent failures (e.g. passorder submitted
         # but order not found in system). Surfaced to client via server_error.
         self._last_server_error = ""
+        # 信用账户的「查柜台」通道（#202）。query_credit_account 是异步的：结果
+        # 只从 credit_account_callback 出来，所以这里存最后一次回调的结果，由
+        # note_credit_account 填。官方 6.13 明说「只能有一个查询」「建议 30s 一
+        # 次，不可频繁调用」，所以单飞 + 最小间隔，不能每个请求都透传下去。
+        self._credit_account_lock = threading.Lock()
+        self._credit_account_rows = []
+        self._credit_account_seq = 0
+        self._credit_account_stamp = 0.0      # 回调落地的时间
+        self._credit_account_asked = 0.0      # 上一次真的发出查询的时间
+        self._credit_account_inflight = False
+        self._credit_account_error = ""
+        self.credit_account_min_interval_seconds = CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS
+        self.credit_account_max_wait_seconds = CREDIT_ACCOUNT_MAX_WAIT_SECONDS
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -723,7 +748,12 @@ class BigQmtRpcHandlers:
         # True 说明确实拿得到，False 只说明「这条路径上没有」，不等于终端没有。
         info["global_namespace"] = {}
         for name in ("create_sector", "create_sector_folder", "add_sector",
-                     "remove_sector", "remove_stock_from_sector", "reset_sector"):
+                     "remove_sector", "remove_stock_from_sector", "reset_sector",
+                     # query_credit_account 也走这条查：它在 qmt_api 里没有时，
+                     # 要能分清「这台终端根本没有这个函数」和「有但没绑上」。
+                     # 策略侧 _resolve_runtime_name 的兜底正是 builtins，所以
+                     # builtins 里没有就等于这台终端不提供（#202）。
+                     "query_credit_account"):
             found = self.qmt_api.get(name)
             if not callable(found):
                 try:
@@ -734,6 +764,10 @@ class BigQmtRpcHandlers:
             info["global_namespace"][name] = callable(found)
         # 信用接口只读探测：不存在的全局直接标 unavailable；存在的真调一次，
         # 记录是否报错和返回行数（担保品/融券标的可能很多行，只计数）。
+        # get_unclosed_compacts / get_closed_compacts 是两参数签名（accountID,
+        # accountType），单参数调用会撞 boost::python 的 ArgumentError —— 探测
+        # 自己少传一个参数，把一个好用的接口报成 ok:False（#201）。
+        _two_arg = ("get_unclosed_compacts", "get_closed_compacts")
         for name in ("get_assure_contract", "get_enable_short_contract",
                      "get_unclosed_compacts", "get_debt_contract"):
             func = self.qmt_api.get(name)
@@ -741,7 +775,11 @@ class BigQmtRpcHandlers:
                 info["credit_probe"][name] = {"available": False}
                 continue
             try:
-                rows = func(self.account_id) or []
+                if name in _two_arg:
+                    rows = func(self.account_id,
+                                self._configured_account_type(self.account_id)) or []
+                else:
+                    rows = func(self.account_id) or []
                 info["credit_probe"][name] = {
                     "available": True, "ok": True, "rows": len(rows),
                 }
@@ -750,10 +788,147 @@ class BigQmtRpcHandlers:
                     "available": True, "ok": False,
                     "error": "%s: %s" % (exc.__class__.__name__, exc),
                 }
+        # 信用账户对象本身（query_credit_detail 的数据源）。空列表有两种成因 ——
+        # 这本账户不是信用账户，还是这台终端读不到 —— m_nBrokerType 能分开：
+        # 3 = 信用。#201 的报告只看到「空列表」，无从判断是哪一种。
+        info["credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"] = \
+            self._probe_credit_account_object()
         info["sector_probe"] = self._probe_sector_channels()
         info["order_watch"] = self._probe_order_watch()
         info["reply_residency"] = self._probe_reply_residency()
         return info
+
+    # ------------------------------------------------------------------
+    # 信用账户「查柜台」通道（#202）
+    # ------------------------------------------------------------------
+
+    def note_credit_account(self, seq, result):
+        """credit_account_callback 的落点。
+
+        QMT 从 C++ 回调线程调进来，所以这里只做「归一化 + 存下来」，绝不碰
+        get_trade_detail_data 之类需要主线程上下文的东西，也绝不抛出去 ——
+        回调里抛异常在 QMT 那边表现为无堆栈的 SystemError。
+        """
+        try:
+            rows = _normalize_detail_rows([result] if result is not None else [])
+        except Exception as exc:
+            with self._credit_account_lock:
+                self._credit_account_inflight = False
+                self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
+            return False
+        with self._credit_account_lock:
+            self._credit_account_rows = rows
+            self._credit_account_stamp = time.time()
+            self._credit_account_inflight = False
+            self._credit_account_error = ""
+            try:
+                self._credit_account_seq = int(seq)
+            except Exception:
+                pass
+        return True
+
+    def _issue_credit_account_query(self, account_id):
+        """Fire query_credit_account once, honouring the counter's rate limit.
+
+        Returns (issued, reason). Not issuing is a normal outcome, not a
+        failure: the cached answer is still served.
+        """
+        func = self.qmt_api.get("query_credit_account")
+        if not callable(func):
+            return False, "query_credit_account is not bound in this deployment"
+        context_info = getattr(self.market_data, "context_info", None)
+        if context_info is None:
+            return False, "no ContextInfo available"
+        now = time.time()
+        with self._credit_account_lock:
+            if self._credit_account_inflight:
+                return False, "a query is already in flight"
+            since = now - self._credit_account_asked
+            if self._credit_account_asked and since < self.credit_account_min_interval_seconds:
+                return False, ("rate limited: %.1fs since the last query, minimum %.1fs"
+                               % (since, self.credit_account_min_interval_seconds))
+            self._credit_account_inflight = True
+            self._credit_account_asked = now
+            seq = int(now)
+        try:
+            func(account_id, seq, context_info)
+        except Exception as exc:
+            with self._credit_account_lock:
+                self._credit_account_inflight = False
+                self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
+            return False, self._credit_account_error
+        return True, ""
+
+    def _handle_query_credit_account(self, params):
+        """信用账户明细，查柜台的那条路（官方参考 6.13）。
+
+        query_credit_account(accId, seq, ContextInfo) 是异步的，结果只从
+        credit_account_callback 出来，所以这个 handler 做的是：发一次查询（受
+        30s 最小间隔约束），有界地等回调落地，然后连同「数据是什么时候的、这次
+        有没有真发出去」一起返回。等不到就返回上一次的缓存 —— 但响应里会说清楚
+        stale=true，不会把陈数据冒充新的。
+        """
+        account_id = self._request_account_id(params)
+        wait_seconds = params.get("wait_seconds")
+        if wait_seconds is None:
+            wait_seconds = CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS
+        wait_seconds = max(0.0, min(self.credit_account_max_wait_seconds,
+                                    float(wait_seconds)))
+        with self._credit_account_lock:
+            stamp_before = self._credit_account_stamp
+        issued, reason = self._issue_credit_account_query(account_id)
+        deadline = time.time() + wait_seconds
+        while issued and time.time() < deadline:
+            with self._credit_account_lock:
+                if self._credit_account_stamp > stamp_before:
+                    break
+                if not self._credit_account_inflight:
+                    break
+            # sleep 让出 GIL，回调线程才拿得到 —— busy-wait 会把它锁死在门外。
+            time.sleep(0.02)
+        with self._credit_account_lock:
+            rows = list(self._credit_account_rows)
+            stamp = self._credit_account_stamp
+            error = self._credit_account_error
+            seq = self._credit_account_seq
+        return {
+            "rows": rows,
+            "count": len(rows),
+            "query_issued": issued,
+            "not_issued_reason": "" if issued else reason,
+            "fresh": bool(stamp and stamp > stamp_before),
+            "stale": bool(rows and not (stamp and stamp > stamp_before)),
+            "age_seconds": round(time.time() - stamp, 3) if stamp else None,
+            "seq": seq,
+            "error": error,
+            "callback_bound": callable(self.qmt_api.get("query_credit_account")),
+        }
+
+    def _probe_credit_account_object(self):
+        """Read-only probe of the credit account object behind query_credit_detail.
+
+        Reports the row count and, when there is a row, m_nBrokerType (3 =
+        信用) plus whether the credit-only fields came through -- so an empty
+        answer can be told apart from a non-credit account, which the bare
+        [] the reporter saw could not (#201).
+        """
+        gateway = self.order_gateway
+        if gateway is None or gateway.get_trade_detail_data is None:
+            return {"available": False}
+        try:
+            rows = _normalize_detail_rows(
+                gateway.get_trade_detail_data(
+                    self.account_id, "CREDIT", "ACCOUNT", "")) or []
+        except Exception as exc:
+            return {"available": True, "ok": False,
+                    "error": "%s: %s" % (exc.__class__.__name__, exc)}
+        report = {"available": True, "ok": True, "rows": len(rows)}
+        if rows and isinstance(rows[0], dict):
+            report["broker_type"] = rows[0].get("m_nBrokerType")
+            report["has_credit_fields"] = any(
+                key in rows[0] for key in
+                ("m_dPerAssurescaleValue", "m_dFinMaxQuota", "m_dSloMaxQuota"))
+        return report
 
     def _probe_reply_residency(self):
         """How long finished replies wait for the transport to send them.
@@ -1321,20 +1496,28 @@ class BigQmtRpcHandlers:
             getattr(gateway, "account_type", "CREDIT") or "CREDIT"
         ).strip().upper()
 
-    def _query_trade_detail(self, params, detail_type, strategy_name=""):
+    def _query_trade_detail(self, params, detail_type, strategy_name="",
+                            account_type=None):
         """get_trade_detail_data with one of the 6 official detail types.
 
         Official strDatatype values: ACCOUNT / POSITION / POSITION_STATISTICS /
-        ORDER / DEAL / TASK. Other strings (CREDIT etc.) are NOT supported by
-        this API — use the dedicated functions below for margin queries.
+        ORDER / DEAL / TASK. Other strings are NOT supported as *detail types* —
+        use the dedicated functions below for the margin contract queries.
+
+        *account_type* overrides the deployment's configured type for this one
+        call. That is the ACCOUNT-TYPE axis, not the detail-type axis: the
+        credit account object is `(accId, 'CREDIT', 'ACCOUNT')`, which the
+        caller asks for explicitly regardless of what this deployment trades
+        as (#201).
         """
         account_id = self._request_account_id(params)
         gateway = self.order_gateway
         if gateway is None or gateway.get_trade_detail_data is None:
             return []
-        account_type = (gateway._resolve_account_type(account_id)
-                        if hasattr(gateway, "_resolve_account_type")
-                        else getattr(gateway, "account_type", "STOCK"))
+        if account_type is None:
+            account_type = (gateway._resolve_account_type(account_id)
+                            if hasattr(gateway, "_resolve_account_type")
+                            else getattr(gateway, "account_type", "STOCK"))
         try:
             rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
             return _normalize_detail_rows(rows)
@@ -1350,8 +1533,17 @@ class BigQmtRpcHandlers:
         return self._query_trade_detail(params, "TASK")
 
     def _handle_query_credit_detail(self, params):
-        # 融资融券账户明细 — 官方独立函数 get_debt_contract
-        return self._call_qmt_global("get_debt_contract", self._request_account_id(params))
+        # 信用（两融）账户明细 — get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')
+        # 返回 CCreditAccountDetail（维持担保比例 / 融资融券授信额度 / 合约金额…），
+        # 与 MiniQMT query_credit_detail -> XtCreditDetail 对应，也是本仓
+        # docs/MiniQMT_2_BigQMT-Skill/api_mapping.md 一直记着的映射。
+        #
+        # 0.3.23 之前这里调的是 get_debt_contract(accId)：那是「负债合约明细」——
+        # 一张张融资融券合约，不是账户对象，而且官方参考 6.17 已标记【已弃用】
+        # （改用 get_unclosed_compacts / get_closed_compacts）。两融账户查它必然
+        # 拿不到账户信息，没有未了结负债时更是直接空列表（#201）。负债合约本身
+        # 走 query_stk_compacts（get_unclosed_compacts）。
+        return self._query_trade_detail(params, "ACCOUNT", account_type="CREDIT")
 
     def _handle_query_stk_compacts(self, params):
         # 未平仓合约（负债）— 官方 get_unclosed_compacts
