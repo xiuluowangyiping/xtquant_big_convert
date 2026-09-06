@@ -84,6 +84,21 @@ CREDIT_CONTRACT_CHECKS = [
      "get_debt_contract(accId)", {}),
 ]
 
+# #204 一并推回主线程的其余交易类全局函数。不是两融，但和上面那批是同一个
+# 修复：它们原来都跑在后台 listener 线程上，而 QMT 交易类查询在主策略线程之外
+# 返回「行数对、字段全空」的对象。放进报告，一次跑完能把 #204/#205 全测到。
+OTHER_TRADE_GLOBAL_CHECKS = [
+    ("get_option_subject_position", "期权标的持仓",
+     "get_option_subject_position(accId)", {}),
+    ("get_comb_option", "组合期权持仓", "get_comb_option(accId)", {}),
+    ("get_new_purchase_limit", "新股申购额度", "get_new_purchase_limit(accId)", {}),
+    ("get_ipo_data", "新股数据（早就 defer 的，做对照）", "get_ipo_data(type)", {}),
+    # #205：官方签名是 (accountID, accountType)，原来一个参数都没传，
+    # _call_qmt_global 把 TypeError 吞掉返回空 —— 从客户端看和「没开港股通」一样。
+    ("get_hkt_exchange_rate", "港股通汇率【#205 修复的】",
+     "get_hkt_exchange_rate(accId, accountType)", {}),
+]
+
 # 对照组：不是两融接口，用来确认桥本身是活的。如果这几个也空，那问题不在两融。
 CONTROL_CHECKS = [
     ("ping", "存活/版本", "-", {}),
@@ -209,7 +224,8 @@ def summarize_rows(rows, full, keys_are_data=False):
     present = [k for k in fields
                if first.get(k) is not None and first.get(k) != ""]
     out["populated_fields"] = len(present)
-    out["hollow"] = not present
+    # 有字段、但每个字段都没值 —— 这才是跑错线程的签名。零字段是没数据。
+    out["hollow"] = bool(fields) and not present
     out["all_numeric_zero"] = (not populated) and any(
         isinstance(first.get(k), (int, float)) and not isinstance(first.get(k), bool)
         for k in fields)
@@ -230,7 +246,10 @@ def normalize_result(result):
         if "rows" in result and isinstance(result["rows"], list):
             extra = dict((k, v) for k, v in result.items() if k != "rows")
             return result["rows"], extra
-        return [result], {}
+        # 空 dict 是「没数据」，不是「一行空数据」。当成一行的话，下面的
+        # hollow 判据（字段全空）会对它成立 —— 实跑第一次就把已经 defer 的
+        # get_ipo_data 误报成跑错线程了。
+        return ([result] if result else []), {}
     if isinstance(result, (list, tuple)):
         return list(result), {}
     return [result], {}
@@ -323,6 +342,8 @@ def render_text(report):
 
     for title, key in (("信用账户明细（这次报告的重点）", "credit_account"),
                        ("负债合约 / 标的", "credit_contracts"),
+                       ("其余交易类全局函数（#204 一并推回主线程 / #205）",
+                        "other_trade_globals"),
                        ("对照组（非两融，用来确认桥本身是活的）", "control")):
         add("-" * 72)
         add(title)
@@ -522,7 +543,8 @@ def main(argv=None):
             "read_only": True,
             "orders_placed": 0,
         },
-        "checks": {"credit_account": [], "credit_contracts": [], "control": []},
+        "checks": {"credit_account": [], "credit_contracts": [],
+                   "other_trade_globals": [], "control": []},
     }
 
     report["meta"]["bridge_version"] = handshake.get("version", "?")
@@ -539,6 +561,10 @@ def main(argv=None):
     for method, label, backend, params in CREDIT_CONTRACT_CHECKS:
         print("  ->", method)
         report["checks"]["credit_contracts"].append(
+            run_check(call, method, label, backend, params, args.full))
+    for method, label, backend, params in OTHER_TRADE_GLOBAL_CHECKS:
+        print("  ->", method)
+        report["checks"]["other_trade_globals"].append(
             run_check(call, method, label, backend, params, args.full))
     for check in CONTROL_CHECKS:
         method, label, backend, params = check[:4]

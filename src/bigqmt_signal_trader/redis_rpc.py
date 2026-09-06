@@ -949,7 +949,9 @@ class BigQmtRpcHandlers:
         present = [key for key, value in first.items()
                    if value is not None and value != ""]
         report["populated_fields"] = len(present)
-        if normalized and not present:
+        # first 必须真的有字段。零字段是「没数据」，不是「空行」—— 判错的话
+        # 一个返回 {} 的接口会被报成跑错线程（本机实跑第一次就误报了）。
+        if first and not present:
             # 行在、字段全空 —— 这就是跑错线程的签名，必须说出来，不能让
             # 一个 rows=71002 看着像成功。
             report["hollow"] = True

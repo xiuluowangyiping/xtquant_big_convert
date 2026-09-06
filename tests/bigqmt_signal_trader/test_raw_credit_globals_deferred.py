@@ -193,6 +193,14 @@ class HollowRowProbeTest(unittest.TestCase):
         self.assertNotIn("hollow", probe)
         self.assertEqual(probe["populated_fields"], 2)
 
+    def test_a_row_with_no_fields_is_not_hollow(self):
+        """零字段是「没数据」，不是「空行」—— 判错会把返回 {} 的接口报成跑错线程。"""
+        probe = _handlers({"get_debt_contract": lambda a: [{}]}).handle(
+            "probe_capabilities", {})["credit_probe"]["get_debt_contract"]
+
+        self.assertEqual(probe["rows"], 1)
+        self.assertNotIn("hollow", probe)
+
     def test_empty_result_is_not_hollow(self):
         """真的没数据和拿到一堆空行是两回事。"""
         probe = _handlers({"get_debt_contract": lambda a: []}).handle(

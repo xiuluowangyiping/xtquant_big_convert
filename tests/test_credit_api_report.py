@@ -24,7 +24,7 @@ import credit_api_report as rep  # noqa: E402
 
 
 ALL_CHECKS = (rep.CREDIT_ACCOUNT_CHECKS + rep.CREDIT_CONTRACT_CHECKS
-              + rep.CONTROL_CHECKS)
+              + rep.OTHER_TRADE_GLOBAL_CHECKS + rep.CONTROL_CHECKS)
 
 
 class ReadOnlyTest(unittest.TestCase):
@@ -139,6 +139,25 @@ class SummaryTest(unittest.TestCase):
         """没有负债就是 0，不能当成没拿到。"""
         out = rep.summarize_rows(
             [{"m_dTotalDebt": 0.0, "m_dFinDebt": 0}], full=False)
+        self.assertFalse(out["hollow"])
+        self.assertEqual(out["populated_fields"], 2)
+
+    def test_empty_mapping_is_no_data_not_a_hollow_row(self):
+        """空 dict 是没数据。当成一行的话 hollow 判据会对它成立 —— 实跑第一次
+        就把已经 defer 的 get_ipo_data 误报成跑错线程了。"""
+        rows, _extra = rep.normalize_result({})
+        self.assertEqual(rows, [])
+
+        out = rep.summarize_rows(rows, full=False)
+        self.assertEqual(out["row_count"], 0)
+        self.assertFalse(out.get("hollow"))
+        state, _ = rep.verdict_for(dict(out, ok=True))
+        self.assertEqual(state, "空")
+
+    def test_non_empty_mapping_is_still_one_row(self):
+        rows, _extra = rep.normalize_result({"KCB": 3500, "SH": 3500})
+        self.assertEqual(len(rows), 1)
+        out = rep.summarize_rows(rows, full=False)
         self.assertFalse(out["hollow"])
         self.assertEqual(out["populated_fields"], 2)
 
@@ -294,6 +313,30 @@ class CoverageTest(unittest.TestCase):
                              or m == "get_debt_contract")
         covered = set(check[0] for check in ALL_CHECKS)
         self.assertEqual(sorted(credit_methods - covered), [])
+
+    def test_every_method_the_fixes_touched_is_exercised(self):
+        """报告是拿回验证的唯一手段 —— 漏一个方法，那个修复就永远没人验。
+
+        #204 把 9 个交易类全局函数推回主线程，#205 修了 get_hkt_exchange_rate
+        的参数。这些必须都在清单里，否则用户跑一趟也测不到。
+        """
+        covered = set(check[0] for check in ALL_CHECKS)
+        for name in ("get_assure_contract", "get_enable_short_contract",
+                     "get_unclosed_compacts", "get_closed_compacts",
+                     "get_debt_contract", "get_option_subject_position",
+                     "get_comb_option", "get_new_purchase_limit",
+                     "get_hkt_exchange_rate"):
+            self.assertIn(name, covered, "#204 推回主线程的 %s 没进报告清单" % name)
+
+    def test_deferred_method_list_and_report_checklist_agree(self):
+        """defer 名单里的交易类方法，报告清单要跟着走 —— 两边别再漂。"""
+        from bigqmt_signal_trader.redis_rpc import LISTENER_DEFERRED_METHODS
+
+        covered = set(check[0] for check in ALL_CHECKS)
+        credit_ish = set(m for m in LISTENER_DEFERRED_METHODS
+                         if "credit" in m or "compact" in m or "assure" in m
+                         or "short_contract" in m or "debt" in m)
+        self.assertEqual(sorted(credit_ish - covered), [])
 
     def test_both_account_detail_paths_are_checked(self):
         methods = set(c[0] for c in rep.CREDIT_ACCOUNT_CHECKS)
