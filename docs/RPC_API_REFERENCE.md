@@ -351,7 +351,11 @@
 - **返回**：`{"rows": [...], "count": n, "query_issued": bool, "not_issued_reason": str, "fresh": bool, "stale": bool, "age_seconds": float|null, "seq": int, "error": str, "callback_bound": bool}`
 - **为什么不是裸列表**：大 QMT 那边 `query_credit_account(accId, seq, ContextInfo)` 立刻返回，结果只从 `credit_account_callback` 出来。桥替你发查询、等回调、缓存结果，所以这条 RPC 本身是同步的 —— 但**空列表有好几种成因**（没绑上 / 被限流 / 发了没等到回调 / 真没数据），只回一个 `[]` 分不开。看 `query_issued`、`fresh`、`callback_bound`，别只看 `rows`。
 - **限流**：官方参考 6.13 写明「只能有一个查询」「建议 30s 一次，不可频繁调用」。桥按 30 秒最小间隔挡住过密的查询，直接返回上一次的结果并标 `stale=true`，不会替你去打柜台。
-- **需要重启策略**：`credit_account_callback` 定义在入口文件命名空间里（QMT 只往被挂载的那个文件回调），而入口文件 `reload_deployment()` 刷不了。`callback_bound=false` 通常就是「部署了但没重启」。
+- **`callback_bound=false` 有两种成因，别白重启一次**：
+  - **这台终端根本没有 `query_credit_account` 这个全局函数** —— 重启也没用，只能走同步那条。维护者的国金 QMT 就是这种：`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` 都经同一条 `_resolve_runtime_name`（qmt_api → globals → builtins）解析得到，唯独 `query_credit_account` 解析不到，说明 QMT 没注入它。
+  - **有这个函数但没重启策略** —— `credit_account_callback` 定义在入口文件命名空间里（QMT 只往被挂载的那个文件回调），而入口文件 `reload_deployment()` 刷不了，必须真重启。
+
+  `probe_capabilities` 的 `global_namespace["query_credit_account"]` 分得开这两种，体检报告也会直接告诉你是哪一种。
 - **客户端**：`xt_trader.query_credit_account(account, wait_seconds=None)`
 
 > **体检工具**：`python tools/credit_api_report.py` 把上面每个两融接口都只读调一遍，导出一份可以直接贴到 issue 的报告（账号打码、金额不带原值、持仓代码不进报告）。维护者没有两融账户，两融那一片只能靠有两融账户的用户跑一次回报。

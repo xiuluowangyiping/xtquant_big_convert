@@ -216,6 +216,29 @@ class ConclusionTest(unittest.TestCase):
         ]))
         self.assertIn("两条路都有数据", "\n".join(out))
 
+    def test_terminal_without_the_global_is_told_restarting_wont_help(self):
+        """「没绑上」有两种成因，差别很大，别让人白重启一次策略。"""
+        report = self._report([
+            {"method": "query_credit_detail", "ok": True, "row_count": 0},
+            {"method": "query_credit_account", "ok": True, "row_count": 0,
+             "envelope": {"callback_bound": False}},
+        ])
+        report["probe"] = {"global_namespace": {"query_credit_account": False}}
+        joined = "\n".join(rep.build_conclusions(report))
+        self.assertIn("没有 query_credit_account", joined)
+        self.assertIn("重启策略也解决不了", joined)
+
+    def test_bound_in_namespace_but_unbound_points_at_the_restart(self):
+        report = self._report([
+            {"method": "query_credit_detail", "ok": True, "row_count": 0},
+            {"method": "query_credit_account", "ok": True, "row_count": 0,
+             "envelope": {"callback_bound": False}},
+        ])
+        report["probe"] = {"global_namespace": {"query_credit_account": True}}
+        joined = "\n".join(rep.build_conclusions(report))
+        self.assertIn("重启策略", joined)
+        self.assertNotIn("重启策略也解决不了", joined)
+
     def test_dead_bridge_is_diagnosed_before_blaming_credit(self):
         """对照组也空的话，问题不在两融接口 —— 别让人去查错的地方。"""
         out = rep.build_conclusions(self._report(

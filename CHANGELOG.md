@@ -33,7 +33,7 @@
 
 - **#201 的取数路径经维护者实测确认**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里能取到信用账户信息。但**这个仓的 RPC 链路本身没有在真实两融账户上跑过** —— 维护者的部署账户是普通股票账户（`m_nBrokerType=2`），信用账本不存在，所有两融接口返回空都是正确行为，证明不了这条链路端到端通。
 
-- **#202 的异步通道完全未验证**，且默认不需要它。`callback_bound` 在维护者的部署上仍是 `false`（入口文件改动要真的重启策略）。
+- **#202 的异步通道在维护者的终端上根本不可用，也就无从验证**，且默认不需要它。重启策略后 `callback_bound` 仍是 `false`：`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` 都经同一条 `_resolve_runtime_name`（qmt_api → globals → builtins）解析得到，唯独 `query_credit_account` 解析不到 —— **这台国金 QMT 没有注入这个全局函数**，重启解决不了。这反过来说明同步那条不只是「够用」，在这类终端上是**唯一**的路。`probe_capabilities` 新增的 `global_namespace["query_credit_account"]` 能把「终端没有」和「有但没重启」分开，体检报告会直接说是哪一种。
 
 - 已验证的部分：全量测试 1631 passed（收集数 == 文件数）、#201 用例修复前 4 red / 修复后 green、实盘上 `probe_capabilities` 的 `ArgumentError` 已消失、新增探测项能答、体检工具端到端跑通并正确判定「这不是信用账户」、两个单文件构建器重新生成后都带上了回调且 no-redis 那份仍 GBK 可解析。
 

@@ -391,6 +391,22 @@ def build_conclusions(report):
     if not control_alive:
         out.append("对照组也没数据 —— 问题多半不在两融接口，先查桥/账户/终端本身。")
 
+    # query_credit_account 报「没绑上」有两种成因，差别很大：这台终端根本没有
+    # 这个全局函数（那就无解，只能走同步那条），还是有但没重启策略（重启就好）。
+    # probe 的 global_namespace 走的是策略侧 _resolve_runtime_name 同一条解析
+    # 路径（qmt_api -> globals -> builtins），所以它能分开这两种。
+    counter_entry = by_method.get("query_credit_account", {})
+    if (counter_entry.get("envelope") or {}).get("callback_bound") is False:
+        in_namespace = ((report.get("probe") or {}).get("global_namespace")
+                        or {}).get("query_credit_account")
+        if in_namespace is False:
+            out.append("这台终端没有 query_credit_account 这个全局函数（QMT 没注入），"
+                       "查柜台那条路在这台机器上不可用 —— 用同步的 "
+                       "query_credit_detail。重启策略也解决不了。")
+        else:
+            out.append("query_credit_account 没绑上，多半是部署了但没**重启策略**"
+                       "（入口文件 reload_deployment() 刷不了）。不影响同步那条。")
+
     cached = by_method.get("query_credit_detail", {})
     counter = by_method.get("query_credit_account", {})
     cached_ok = bool(cached.get("row_count"))

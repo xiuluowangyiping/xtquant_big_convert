@@ -748,7 +748,12 @@ class BigQmtRpcHandlers:
         # True 说明确实拿得到，False 只说明「这条路径上没有」，不等于终端没有。
         info["global_namespace"] = {}
         for name in ("create_sector", "create_sector_folder", "add_sector",
-                     "remove_sector", "remove_stock_from_sector", "reset_sector"):
+                     "remove_sector", "remove_stock_from_sector", "reset_sector",
+                     # query_credit_account 也走这条查：它在 qmt_api 里没有时，
+                     # 要能分清「这台终端根本没有这个函数」和「有但没绑上」。
+                     # 策略侧 _resolve_runtime_name 的兜底正是 builtins，所以
+                     # builtins 里没有就等于这台终端不提供（#202）。
+                     "query_credit_account"):
             found = self.qmt_api.get(name)
             if not callable(found):
                 try:
