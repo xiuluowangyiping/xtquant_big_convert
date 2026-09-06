@@ -351,6 +351,81 @@ class QueryCreditAccountTest(unittest.TestCase):
         self.assertFalse(out["wait_skipped_same_thread"])
         self.assertGreaterEqual(out["waited_seconds"], 0.1)
 
+
+class StaleCacheGuardTest(unittest.TestCase):
+    """缓存不会自己刷新，所以太陈的数据宁可不给。
+
+    真正的风险不是「30 秒 vs 0 秒」，而是一个只读 rows、不看 age_seconds 的
+    调用方，拿几小时前的**维持担保比例**去做决策还毫无察觉 —— 那是强平线。
+    """
+
+    def _handlers_with_cached(self, age_seconds):
+        handlers = _handlers(lambda *a: None)
+        handlers.credit_account_min_interval_seconds = 0.0
+        handlers.note_credit_account(1, _CreditResult())
+        # 把缓存时间戳往回拨，模拟放了很久
+        handlers._credit_account_stamp = time.time() - age_seconds
+        return handlers
+
+    def test_default_max_age_is_two_minutes(self):
+        from bigqmt_signal_trader.redis_rpc import CREDIT_ACCOUNT_MAX_AGE_SECONDS
+        self.assertEqual(CREDIT_ACCOUNT_MAX_AGE_SECONDS, 120.0)
+        self.assertEqual(_handlers(None).credit_account_max_age_seconds, 120.0)
+
+    def test_fresh_enough_cache_is_returned(self):
+        out = self._handlers_with_cached(30).handle("query_credit_account", {})
+        self.assertEqual(out["count"], 1)
+        self.assertFalse(out["dropped_stale"])
+        self.assertEqual(out["max_age_seconds"], 120.0)
+
+    def test_too_old_cache_is_withheld_and_says_so(self):
+        out = self._handlers_with_cached(3 * 3600).handle("query_credit_account", {})
+
+        self.assertEqual(out["count"], 0)
+        self.assertEqual(out["rows"], [])
+        self.assertTrue(out["dropped_stale"])
+        self.assertIn("不再交出", out["dropped_stale_reason"])
+        self.assertIn("query_credit_detail", out["dropped_stale_reason"])
+        # 年龄仍然如实报出来，别把「扣下了」伪装成「没数据」
+        self.assertGreater(out["age_seconds"], 3000)
+
+    def test_caller_can_opt_out_explicitly(self):
+        out = self._handlers_with_cached(3 * 3600).handle(
+            "query_credit_account", {"max_age_seconds": 0})
+        self.assertEqual(out["count"], 1)
+        self.assertFalse(out["dropped_stale"])
+
+    def test_caller_can_ask_for_a_tighter_bound(self):
+        out = self._handlers_with_cached(60).handle(
+            "query_credit_account", {"max_age_seconds": 10})
+        self.assertEqual(out["count"], 0)
+        self.assertTrue(out["dropped_stale"])
+
+    def test_a_fresh_callback_this_call_is_never_dropped(self):
+        """这一次刚落下的回调不该被年龄规则误伤。"""
+        handlers_box = {}
+
+        def query_credit_account(account_id, seq, context_info):
+            handlers_box["h"].note_credit_account(seq, _CreditResult())
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+        out = handlers.handle("query_credit_account",
+                              {"max_age_seconds": 1, "wait_seconds": 0})
+        self.assertTrue(out["fresh"])
+        self.assertEqual(out["count"], 1)
+        self.assertFalse(out["dropped_stale"])
+
+    def test_empty_cache_is_not_reported_as_dropped(self):
+        """从没拿到过数据 ≠ 数据被扣下，两者的排查方向不同。"""
+        out = _handlers(lambda *a: None).handle("query_credit_account", {})
+        self.assertEqual(out["count"], 0)
+        self.assertFalse(out["dropped_stale"])
+        self.assertEqual(out["dropped_stale_reason"], "")
+
+
+class MethodRegistrationTest(unittest.TestCase):
+
     def test_method_is_whitelisted_and_deferred_to_the_main_thread(self):
         from bigqmt_signal_trader.redis_rpc import (
             LISTENER_DEFERRED_METHODS, READ_METHODS,

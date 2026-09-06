@@ -228,6 +228,17 @@ DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
 # hollow 告警的最小间隔。跑错线程时每一次查询都会 hollow，不节流日志会被刷爆。
 HOLLOW_WARNING_INTERVAL_SECONDS = 60.0
 CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS = 30.0
+# 缓存超过这个年龄就不再交出去。
+#
+# 这条通道的缓存**从不自己刷新** —— 没人调就永远不刷，age_seconds 可以是 44
+# 秒，也可以是三小时。真正的风险不是「30 秒 vs 0 秒」，而是一个只读 rows、
+# 不看 age_seconds 的调用方，拿三小时前的**维持担保比例**去做决策还毫无察觉。
+# 维持担保比例是强平线，读错方向是真损失。
+#
+# 120 秒：官方最小间隔是 30 秒，留够几次调用的余量，又不至于让陈数据在盘中
+# 蒙混过关。要实时的维持担保比例请走 query_credit_detail（同步、读终端本地
+# 缓存、无此问题）。传 0 表示不限制，那是显式放弃这层保护。
+CREDIT_ACCOUNT_MAX_AGE_SECONDS = 120.0
 # 一次 RPC 里最多等回调多久。**默认 0：不等。**
 #
 # handler 跑在 adjust 主线程上（它在 LISTENER_DEFERRED_METHODS 里，必须如此，
@@ -609,6 +620,7 @@ class BigQmtRpcHandlers:
         self._credit_account_callback_thread = ""
         self.credit_account_min_interval_seconds = CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS
         self.credit_account_max_wait_seconds = CREDIT_ACCOUNT_MAX_WAIT_SECONDS
+        self.credit_account_max_age_seconds = CREDIT_ACCOUNT_MAX_AGE_SECONDS
         if allowed_methods is None:
             allowed = set(READ_METHODS)
             if self.allow_order_methods:
@@ -934,6 +946,10 @@ class BigQmtRpcHandlers:
             wait_seconds = CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS
         wait_seconds = max(0.0, min(self.credit_account_max_wait_seconds,
                                     float(wait_seconds)))
+        max_age_seconds = params.get("max_age_seconds")
+        if max_age_seconds is None:
+            max_age_seconds = self.credit_account_max_age_seconds
+        max_age_seconds = max(0.0, float(max_age_seconds))
         with self._credit_account_lock:
             stamp_before = self._credit_account_stamp
             known_callback_thread = self._credit_account_callback_thread
@@ -977,6 +993,17 @@ class BigQmtRpcHandlers:
             error = self._credit_account_error
             seq = self._credit_account_seq
             callbacks = self._credit_account_callbacks
+        # 太陈的数据宁可不给。给出去而不被察觉，比给不出更坏。
+        age = round(time.time() - stamp, 3) if stamp else None
+        dropped_stale = False
+        stale_reason = ""
+        if rows and max_age_seconds > 0 and age is not None and age > max_age_seconds:
+            dropped_stale = True
+            stale_reason = (
+                "缓存已 %.1f 秒未更新，超过 max_age_seconds=%.0f，不再交出 —— "
+                "这条通道的缓存不会自己刷新。查询已发出，稍后再调一次即可拿到"
+                "新的；要实时数据请用 query_credit_detail。" % (age, max_age_seconds))
+            rows = []
         return {
             "rows": rows,
             "count": len(rows),
@@ -984,7 +1011,11 @@ class BigQmtRpcHandlers:
             "not_issued_reason": "" if issued else reason,
             "fresh": bool(stamp and stamp > stamp_before),
             "stale": bool(rows and not (stamp and stamp > stamp_before)),
-            "age_seconds": round(time.time() - stamp, 3) if stamp else None,
+            "age_seconds": age,
+            "max_age_seconds": max_age_seconds,
+            # 有数据但太陈，已经扣下不给 —— 必须说出来，否则和「没数据」没区别
+            "dropped_stale": dropped_stale,
+            "dropped_stale_reason": stale_reason,
             "seq": seq,
             "error": error,
             "callback_bound": callable(self.qmt_api.get("query_credit_account")),
