@@ -1006,6 +1006,48 @@ cd D:\国金证券QMT交易端
 
 > **pyzmq 特殊说明**：包含 C 扩展，不能直接拷贝。Python 3.6 需装 `pyzmq==19.0.2`（最后一个支持 3.6 的版本）。如果 SSL 装不上，可下载对应 wheel 手动 `pip install xxx.whl`。
 
+### C. Redis 服务本身（Windows 上怎么来）
+
+> 上面 B 节表里的 `redis` 是 **redis-py 这个 Python 包**（客户端库），**不是 Redis 服务**。用 redis 传输时你还需要一个**跑着的 Redis 服务**能连——服务端和客户端都连它。装完 redis-py 手里仍然没有 Redis，这一步补上。
+
+Redis 官方从来没有 Windows 版（微软那个老 port 早归档了）。Windows 上不装 WSL 拿到 Redis，最省事的是社区重打包 **redis-windows**：
+
+- 下载：<https://github.com/redis-windows/redis-windows/releases> —— 解压即用，无需 WSL / Linux 子系统。
+- 也可以指向**任何能连到的 Redis**：同机、内网另一台机器、或 Docker 里的都行。Redis 服务不必和 QMT 在同一台机器。
+
+> ⚠️ **redis-windows 是社区重打包，不是 Redis 官方发行**。是否采用由你判断；本项目只做说明，不分发它的二进制。
+
+解压后带一份最小配置启动（`redis.conf`）：
+
+```conf
+# 只监听本机；服务端和客户端都在这台机器时用这个
+bind 127.0.0.1
+port 6379
+# 必设密码：见下方安全提示
+requirepass 换成你自己的强密码
+```
+
+```powershell
+.\redis-server.exe .\redis.conf
+```
+
+配置里对应填法（`bigqmt_signal_trader_local_config.py` 和客户端配置一致）：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "host": "127.0.0.1",   # 跨机时填 Redis 那台的内网 IP
+    "port": 6379,
+    "db": 5,
+    "username": "",        # redis-windows 默认无 ACL 用户，留空
+    "password": "换成你自己的强密码",  # 与 requirepass 一致
+    "transport": "redis",
+}
+```
+
+> 🔒 **务必设密码、只监听本机——这座桥的 RPC 层没有鉴权。** 访问控制只有两层：Redis 自己的凭据，和 `rpc_allow_order_methods` 开关。**能连上这个 Redis、知道队列名的人就能驱动这座桥**，而队列名是 `bigqmt:rpc:queue:<资金账号>`，账号本身就在队列名里、不算秘密。`rpc_allow_order_methods=True` 时这包括**下单和撤单**（默认 `False`）。
+>
+> 所以：**`requirepass` 设强密码 + `bind 127.0.0.1`（只本机）** 是最低要求，别用默认的空密码。**确需跨机**时——绑内网网卡、`requirepass` 照设、并用防火墙只放行客户端那台的 IP；**绝不要**把这个 Redis 暴露到公网。一个空密码、`bind` 放开、防火墙放行的 Windows Redis，挂着一个真实资金账号，是最危险的组合。
+
 ---
 
 ## 快速开始
