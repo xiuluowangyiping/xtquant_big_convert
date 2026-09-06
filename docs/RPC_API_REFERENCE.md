@@ -352,7 +352,10 @@
 - **为什么不是裸列表**：大 QMT 那边 `query_credit_account(accId, seq, ContextInfo)` 立刻返回，结果只从 `credit_account_callback` 出来。桥替你发查询、等回调、缓存结果，所以这条 RPC 本身是同步的 —— 但**空列表有好几种成因**（没绑上 / 被限流 / 发了没等到回调 / 真没数据），只回一个 `[]` 分不开。看 `query_issued`、`fresh`、`callback_bound`，别只看 `rows`。
 - **限流**：官方参考 6.13 写明「只能有一个查询」「建议 30s 一次，不可频繁调用」。桥按 30 秒最小间隔挡住过密的查询，直接返回上一次的结果并标 `stale=true`，不会替你去打柜台。
 - **`callback_bound=false` 有两种成因，别白重启一次**：
-  - **这台终端根本没有 `query_credit_account` 这个全局函数** —— 重启也没用，只能走同步那条。维护者的国金 QMT 就是这种：`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` 都经同一条 `_resolve_runtime_name`（qmt_api → globals → builtins）解析得到，唯独 `query_credit_account` 解析不到，说明 QMT 没注入它。
+  - **桥自己没捕获到它。** QMT 只往被挂载的入口文件的命名空间注入全局函数，入口必须用 `capture_qmt_injected_funcs(globals())` 从策略模块的唯一名单里捕获。入口文件曾经手抄过一份名单并漏了 `query_credit_account`，桥于是拿不到它 —— 而终端明明有。**这类情况下 `global_namespace` 也会是 `False`，所以不能据此断言终端没有这个函数**（#202 就是这么误判的）。改入口文件后必须**真重启策略**，`reload_deployment()` 刷不了入口。
+  - **这台终端确实没有这个函数** —— 那就只能走同步那条。
+
+  两者从桥这边分不开。**判断方法：在大 QMT 的策略里直接写一行 `query_credit_account(accId, int(time.time()), ContextInfo)` 配 `credit_account_callback`,能打印出维持担保比例就说明终端有,问题在桥。**
   - **有这个函数但没重启策略** —— `credit_account_callback` 定义在入口文件命名空间里（QMT 只往被挂载的那个文件回调），而入口文件 `reload_deployment()` 刷不了，必须真重启。
 
   `probe_capabilities` 的 `global_namespace["query_credit_account"]` 分得开这两种，体检报告也会直接告诉你是哪一种。

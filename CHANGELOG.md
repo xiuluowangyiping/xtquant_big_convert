@@ -15,6 +15,14 @@
 
 ### 修复
 
+- **入口文件手抄的 QMT 全局函数名单漏了 `query_credit_account`，桥拿不到它，却被误报成「这台终端没有这个函数」**（#202 后续）：QMT 只往**被挂载的那个文件**的命名空间注入全局函数，所以捕获必须在入口文件里做。策略模块的 `_QMT_INJECTED_GLOBAL_FUNCS` 是这份名单的唯一来源，它自己的注释就写着「do not hand-copy the names elsewhere」—— 而 `BIGQMT_REDIS_DRYRUN.py` 里偏偏有一张手抄表。给策略模块加 `query_credit_account` 时漏了它，于是桥捕获不到 → `probe_capabilities` 报 `callback_bound=false` → 报告据此下结论「这台终端没有 query_credit_account，重启也没用」。
+
+  **而用户在大 QMT 里直接调它是好用的**（维持担保比例 3.35、总负债 1038962.07）。一个桥的 bug 被报成了券商终端的能力缺失 —— 这比返回空更糟，它给出的是一个错误但听起来很确定的结论，会让人不去查真正的地方。
+
+  修法不是再补一个名字，是**别再手抄**：两个被挂载的入口都改成 `capture_qmt_injected_funcs(globals())` 读唯一来源，并加一道闸（`tests/bigqmt_signal_trader/test_no_hand_copied_global_lists.py`）禁止入口文件再出现手抄名单。实盘验证：重启后 `global_namespace` 和 `callback_bound` 都变成 `true`、查询发得出去。**入口文件 `reload_deployment()` 刷不了，这条改动必须真重启策略。**
+
+  同时把三处基于那个错判写下的结论都改了（体检报告的结论文案、`docs/RPC_API_REFERENCE.md`、本文件上一条）：`global_namespace` 为 `False` 只说明「这条解析路径上没有」，**不能**据此断言终端没有这个函数；正确的判断方法是在大 QMT 策略里直接调一次。
+
 - **三个 QMT 全局函数的参数写错，外加两个返回形状用错，全部静默返回空**（#207）：QMT 全局函数的映射是纯手写的，没有任何东西校验它和官方签名对不对。用 AST 把所有调用点扫出来和官方参考比对，查出：`get_value_by_order_id` 只传了 1 个参数（签名要 4 个）、`get_last_order_id` 只传了 1 个（要 3-4 个）、`get_history_trade_detail_data` 传了 4 个且把 `detail_type` 塞到了 `strAccountType` 的位置（要 5 个，和 #96 同一个形状）。全部被 `_call_qmt_global` 的 `except: return []` 吞掉。
 
   参数修好后实盘一跑，又暴露出返回形状也用错了：`get_last_order_id` 返回的是**委托号字符串**，不是行列表，`_normalize_detail_rows` 会去迭代它 —— 真委托号 `'635005110'` 变成 **9 个空 dict**（一个字符一个），QMT 表示「没找到」的 `'-1'` 变成 2 个空 dict，int 直接抛 TypeError 被吞成 `[]`。**委托号被完全销毁**，而这个函数正是官方「下单 → 查单 → 撤单」标准流程的第二步。`get_value_by_order_id` 同理，它返回**单个**委托对象不是列表，迭代它抛异常同样被吞成 `[]`，看起来像「查不到这笔委托」。新增 `_call_qmt_scalar`（保留标量原样）和 `_call_qmt_object`（单对象归一化）两条取数路径。
@@ -65,7 +73,7 @@
 
 - **#201 的取数路径经维护者实测确认**：`get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里能取到信用账户信息。但**这个仓的 RPC 链路本身没有在真实两融账户上跑过** —— 维护者的部署账户是普通股票账户（`m_nBrokerType=2`），信用账本不存在，所有两融接口返回空都是正确行为，证明不了这条链路端到端通。
 
-- **#202 的异步通道在维护者的终端上根本不可用，也就无从验证**，且默认不需要它。重启策略后 `callback_bound` 仍是 `false`：`get_debt_contract` / `get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` 都经同一条 `_resolve_runtime_name`（qmt_api → globals → builtins）解析得到，唯独 `query_credit_account` 解析不到 —— **这台国金 QMT 没有注入这个全局函数**，重启解决不了。这反过来说明同步那条不只是「够用」，在这类终端上是**唯一**的路。`probe_capabilities` 新增的 `global_namespace["query_credit_account"]` 能把「终端没有」和「有但没重启」分开，体检报告会直接说是哪一种。
+- **#202 的异步通道曾被误判为「终端不支持」，实为桥自己的 bug**（已修，见下条「入口文件手抄名单」）。修好并重启后 `callback_bound` 变成 `true`、查询发得出去；但维护者的账户是普通股票账户（`m_nBrokerType=2`），柜台不回调，所以**回调链路本身仍未验证**。`probe_capabilities` 的 `global_namespace["query_credit_account"]` 只说明「这条解析路径上有没有」，**不能**据此断言终端有没有这个函数 —— 原来的结论文案就是这么错的，已改成把两种可能都列出来并建议先在大 QMT 里直接调一次确认。
 
 - 已验证的部分：全量测试 1631 passed（收集数 == 文件数）、#201 用例修复前 4 red / 修复后 green、实盘上 `probe_capabilities` 的 `ArgumentError` 已消失、新增探测项能答、体检工具端到端跑通并正确判定「这不是信用账户」、两个单文件构建器重新生成后都带上了回调且 no-redis 那份仍 GBK 可解析。
 

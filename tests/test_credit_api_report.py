@@ -270,8 +270,14 @@ class ConclusionTest(unittest.TestCase):
         ]))
         self.assertIn("两条路都有数据", "\n".join(out))
 
-    def test_terminal_without_the_global_is_told_restarting_wont_help(self):
-        """「没绑上」有两种成因，差别很大，别让人白重启一次策略。"""
+    def test_unbound_global_never_claims_the_terminal_lacks_it(self):
+        """global_namespace=False 不等于「终端没有这个函数」。
+
+        #202 的教训：入口文件手抄的名单漏了 query_credit_account，桥拿不到它，
+        报告据此断言「这台终端没有这个函数，重启也没用」—— 而用户在大 QMT 里
+        直接调是好用的。一个桥的 bug 被报成了券商终端的能力缺失。错误但听起来
+        很确定的结论，比不给结论更坏。
+        """
         report = self._report([
             {"method": "query_credit_detail", "ok": True, "row_count": 0},
             {"method": "query_credit_account", "ok": True, "row_count": 0,
@@ -279,8 +285,14 @@ class ConclusionTest(unittest.TestCase):
         ])
         report["probe"] = {"global_namespace": {"query_credit_account": False}}
         joined = "\n".join(rep.build_conclusions(report))
-        self.assertIn("没有 query_credit_account", joined)
-        self.assertIn("重启策略也解决不了", joined)
+        # 两种可能都要列出来，并且要给出能分辨的办法
+        self.assertIn("两种可能", joined)
+        self.assertIn("capture_qmt_injected_funcs", joined)
+        self.assertIn("重启", joined)
+        self.assertIn("大 QMT 里直接调", joined)
+        # 绝不能再断言终端的能力
+        self.assertNotIn("这台终端没有 query_credit_account", joined)
+        self.assertNotIn("重启策略也解决不了", joined)
 
     def test_bound_in_namespace_but_unbound_points_at_the_restart(self):
         report = self._report([
