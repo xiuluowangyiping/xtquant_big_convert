@@ -338,12 +338,15 @@
 >
 > | | RPC | 大 QMT | 对象 | 特点 |
 > |---|---|---|---|---|
-> | 终端缓存 | `query_credit_detail` | `get_trade_detail_data(accId,'CREDIT','ACCOUNT')` | `CCreditAccountDetail`（3.14，**非查柜台**）| 同步、无限流；券商没推就是空的 |
-> | 查柜台 | `query_credit_account` | `query_credit_account` + `credit_account_callback` | `CCreditDetail`（3.15）| 异步、权威；官方建议 30s 一次 |
+> | **终端缓存（默认用这条）** | `query_credit_detail` | `get_trade_detail_data(accId,'CREDIT','ACCOUNT')` | `CCreditAccountDetail`（3.14，标注「非查柜台」）| 同步、无限流、不用重启 |
+> | 查柜台（备用） | `query_credit_account` | `query_credit_account` + `credit_account_callback` | `CCreditDetail`（3.15）| 异步、权威；官方建议 30s 一次；要重启策略 |
+>
+> **先用同步那条。** 维护者实测确认 `get_trade_detail_data('<信用账号>', 'credit', 'account', '')` 在大 QMT 里直接取得到信用账户信息，返回 list，取 `[0]`；账号类型和数据类型大小写都不敏感（`'credit'` / `'CREDIT'` 均可）。异步那条只是备用：3.14 那份官方标注「非查柜台」，是终端本地缓存，万一换一家券商的终端不填它，那就只剩查柜台这一条路。不需要的话完全不用理会 `query_credit_account`，不调它就什么都不会发生。
 >
 > 总负债在缓存那份叫 `m_dTotalDebit`，在柜台那份叫 `m_dTotalDebt` —— 只差一个字母，别看错。
 
-### `query_credit_account`
+### `query_credit_account`（备用，一般用不上）
+- **什么时候才需要它**：`query_credit_detail` 在你的终端上取不到时。同步那条是主路径，实测可用；这条是为「终端不填 3.14 那份缓存」的券商准备的后路。
 - **参数**：`account_id`(可选) `wait_seconds`(可选，默认 1.5，上限 10)
 - **返回**：`{"rows": [...], "count": n, "query_issued": bool, "not_issued_reason": str, "fresh": bool, "stale": bool, "age_seconds": float|null, "seq": int, "error": str, "callback_bound": bool}`
 - **为什么不是裸列表**：大 QMT 那边 `query_credit_account(accId, seq, ContextInfo)` 立刻返回，结果只从 `credit_account_callback` 出来。桥替你发查询、等回调、缓存结果，所以这条 RPC 本身是同步的 —— 但**空列表有好几种成因**（没绑上 / 被限流 / 发了没等到回调 / 真没数据），只回一个 `[]` 分不开。看 `query_issued`、`fresh`、`callback_bound`，别只看 `rows`。
