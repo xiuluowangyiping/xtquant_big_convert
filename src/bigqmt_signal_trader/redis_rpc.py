@@ -1552,6 +1552,50 @@ class BigQmtRpcHandlers:
         except Exception:
             return []
 
+    def _call_qmt_scalar(self, func_name, *args, **kwargs):
+        """Same as _call_qmt_global, for the QMT globals that answer with a
+        plain scalar rather than detail rows -- get_last_order_id returns the
+        委托号 as a str.
+
+        The row normaliser iterates whatever it is handed, so a string goes in
+        and a list of one empty dict PER CHARACTER comes out: the real order id
+        '635005110' became [{}, {}, {}, {}, {}, {}, {}, {}, {}] and '-1'
+        (QMT's "not found") became [{}, {}]. An int raises TypeError inside the
+        normaliser and is swallowed to []. Same shape as #96, where get_ipo_data
+        was destroyed the same way (#207).
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return None
+        try:
+            return _normalize_mapping_value(func(*args, **kwargs))
+        except Exception:
+            return None
+
+    def _call_qmt_object(self, func_name, *args, **kwargs):
+        """Same as _call_qmt_global, for the QMT globals that answer with ONE
+        object rather than a list of them -- get_value_by_order_id returns a
+        single 委托/成交 object.
+
+        Handing that straight to the row normaliser iterates the object itself,
+        which raises TypeError and gets swallowed to [] -- the call looks like
+        "no such order" when it actually worked (#207).
+        """
+        func = self.qmt_api.get(func_name)
+        if func is None:
+            return {}
+        try:
+            value = func(*args, **kwargs)
+        except Exception:
+            return {}
+        if value is None:
+            return {}
+        if isinstance(value, (list, tuple)):
+            rows = _normalize_detail_rows(value)
+            return rows[0] if rows else {}
+        rows = _normalize_detail_rows([value])
+        return rows[0] if rows else {}
+
     def _call_qmt_mapping(self, func_name, *args, **kwargs):
         """Same as _call_qmt_global, for the QMT globals that answer with a
         mapping rather than a row list -- get_ipo_data, get_new_purchase_limit.
@@ -1688,13 +1732,41 @@ class BigQmtRpcHandlers:
 
     # 官方交易查询函数（直接暴露）
     def _handle_get_value_by_order_id(self, params):
+        # 官方签名 get_value_by_order_id(orderId, accountID, strAccountType,
+        # strDatatype)，strDatatype 是 'ORDER' / 'DEAL'（6.11）。原来只传了
+        # orderId 一个参数 —— 少三个，_call_qmt_global 把 TypeError 吞掉返回
+        # 空，从客户端看就是「查不到这笔委托」（#207）。
         order_id = str(params.get("order_id") or params.get("order_sysid") or "")
         if not order_id:
             raise ValueError("order_id is required")
-        return self._call_qmt_global("get_value_by_order_id", order_id)
+        account_id = self._request_account_id(params)
+        detail_type = str(params.get("detail_type")
+                          or params.get("datatype") or "ORDER").strip().upper()
+        # 返回的是单个委托/成交对象，不是行列表 —— 走 _call_qmt_object，
+        # 否则 _normalize_detail_rows 会去迭代这个对象、抛 TypeError 被吞成
+        # []，看起来像「查不到这笔委托」（#207）。
+        return self._call_qmt_object(
+            "get_value_by_order_id", order_id, account_id,
+            self._configured_account_type(account_id), detail_type)
 
     def _handle_get_last_order_id(self, params):
-        return self._call_qmt_global("get_last_order_id", self._request_account_id(params))
+        # 官方签名 get_last_order_id(accountID, strAccountType, strDatatype
+        # [, strategyName])（6.11）。原来只传了 accountID。strategyName 只对
+        # 本地下单有效，用部署的默认策略名，空则不传。
+        account_id = self._request_account_id(params)
+        detail_type = str(params.get("detail_type")
+                          or params.get("datatype") or "ORDER").strip().upper()
+        strategy_name = params.get("strategy_name")
+        if strategy_name is None:
+            strategy_name = self.default_strategy_name
+        strategy_name = str(strategy_name or "")
+        args = [account_id, self._configured_account_type(account_id), detail_type]
+        if strategy_name:
+            args.append(strategy_name)
+        # 返回的是委托号字符串，不是行列表 —— 走 _call_qmt_scalar。实盘实测：
+        # 走 _call_qmt_global 时 '635005110' 被按字符迭代成 9 个空 dict，
+        # QMT 表示「没找到」的 '-1' 变成 2 个空 dict（#207）。
+        return self._call_qmt_scalar("get_last_order_id", *args)
 
     def _handle_get_ipo_data(self, params):
         # get_ipo_data answers with a dict KEYED BY SUBSCRIPTION CODE, not with
@@ -1717,8 +1789,14 @@ class BigQmtRpcHandlers:
         detail_type = str(params.get("detail_type") or params.get("datatype") or "DEAL")
         start_date = str(params.get("start_date") or params.get("start_time") or "")
         end_date = str(params.get("end_date") or params.get("end_time") or "")
+        # 官方签名 get_history_trade_detail_data(accountID, strAccountType,
+        # strDatatype, startDate, endDate)（6.9）。原来漏了 strAccountType，
+        # 于是 detail_type 被塞进了账户类型的位置 —— 少一个参数、还错位，
+        # 和 #96 里 get_ipo_data 把 account_id 当 type 传是同一个形状（#207）。
         result = self._call_qmt_global(
-            "get_history_trade_detail_data", account_id, detail_type, start_date, end_date
+            "get_history_trade_detail_data", account_id,
+            self._configured_account_type(account_id),
+            detail_type, start_date, end_date
         )
         return result
 
@@ -2599,6 +2677,12 @@ def _normalize_detail_rows(rows):
         item = {}
         for name in dir(row):
             if name.startswith("_"):
+                continue
+            # QMT 的委托对象上除了 60 个 m_* 字段，还挂着 60 个枚举常量，
+            # 名字是 '0' / '-1' / '101' 这种数字串（值就是常量本身）。dir()
+            # 一并刮进来会让载荷翻倍、还夹着看不懂的键。非标识符的名字一律
+            # 丢掉 —— 真字段（m_xxx / 普通属性名）都是合法标识符，不会误伤。
+            if not name.isidentifier():
                 continue
             try:
                 value = getattr(row, name)
