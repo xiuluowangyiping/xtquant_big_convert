@@ -228,10 +228,21 @@ DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
 # hollow 告警的最小间隔。跑错线程时每一次查询都会 hollow，不节流日志会被刷爆。
 HOLLOW_WARNING_INTERVAL_SECONDS = 60.0
 CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS = 30.0
-# 一次 RPC 里最多等回调多久。回调走 QMT 的 C++ 线程，handler 在 adjust 主线程
-# 上；这里的等待用 sleep 轮询让出 GIL，回调才落得下来。默认给得短，因为拿不到
-# 新的就退回上一次的缓存值，不必把主线程按住。
-CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS = 1.5
+# 一次 RPC 里最多等回调多久。**默认 0：不等。**
+#
+# handler 跑在 adjust 主线程上（它在 LISTENER_DEFERRED_METHODS 里，必须如此，
+# 否则拿不到交易上下文）。原来这里 sleep 轮询等回调，实盘上（真两融账户、
+# 已确认在大 QMT 里回调能触发）表现是：query_issued=true、等满 8 秒、
+# callbacks_seen=0、无任何报错。
+#
+# 最可能的解释：QMT 把 credit_account_callback 投递到主线程上，而我正用等待
+# 堵着这条线程 —— 用等待堵死了唯一能送达的那条路，回调只可能在 handler 返回
+# 之后才进来。order_callback 走 C++ 线程，这个不一定同理，不能照搬。
+#
+# 所以默认改成「发出去就返回」：这一次拿到的是缓存（或空），回调随后自己落下，
+# 下一次调用就能取到。在两种假设下都安全 —— 如果回调其实走的是 C++ 线程，
+# 代价也只是多一次调用。想等的人显式传 wait_seconds 即可。
+CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS = 0.0
 CREDIT_ACCOUNT_MAX_WAIT_SECONDS = 10.0
 TERMINAL_NON_CANCEL_ORDER_STATUSES = {"56", "57"}
 # 51 已报待撤 / 52 部成待撤: the exchange has ACCEPTED the cancel and it is
@@ -590,6 +601,12 @@ class BigQmtRpcHandlers:
         self._credit_account_asked = 0.0      # 上一次真的发出查询的时间
         self._credit_account_inflight = False
         self._credit_account_error = ""
+        # QMT 实际回调了多少次。0 = QMT 没回调；>0 但没数据 = 回调来了但结果
+        # 没落进来。两者的排查方向完全不同，从外面看却一样（#202）。
+        self._credit_account_callbacks = 0
+        # 回调实际落在哪条线程上。adjust 线程 = 等待会把它堵死；C++ 回调线程
+        # = 等待是安全的。这是个事实问题，记下来就不用猜（#202）。
+        self._credit_account_callback_thread = ""
         self.credit_account_min_interval_seconds = CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS
         self.credit_account_max_wait_seconds = CREDIT_ACCOUNT_MAX_WAIT_SECONDS
         if allowed_methods is None:
@@ -815,6 +832,12 @@ class BigQmtRpcHandlers:
         # 3 = 信用。#201 的报告只看到「空列表」，无从判断是哪一种。
         info["credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"] = \
             self._probe_credit_account_object()
+        info["credit_callback"] = {
+            "note_credit_account_available": hasattr(self, "note_credit_account"),
+            "callbacks_seen": getattr(self, "_credit_account_callbacks", 0),
+            "cached_rows": len(getattr(self, "_credit_account_rows", []) or []),
+            "last_callback_thread": getattr(self, "_credit_account_callback_thread", ""),
+        }
         info["thread_routing"] = self._probe_thread_routing()
         info["sector_probe"] = self._probe_sector_channels()
         info["order_watch"] = self._probe_order_watch()
@@ -836,10 +859,17 @@ class BigQmtRpcHandlers:
             rows = _normalize_detail_rows([result] if result is not None else [])
         except Exception as exc:
             with self._credit_account_lock:
+                self._credit_account_callbacks += 1
                 self._credit_account_inflight = False
                 self._credit_account_error = "%s: %s" % (exc.__class__.__name__, exc)
             return False
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
         with self._credit_account_lock:
+            self._credit_account_callbacks += 1
+            self._credit_account_callback_thread = thread_name
             self._credit_account_rows = rows
             self._credit_account_stamp = time.time()
             self._credit_account_inflight = False
@@ -865,7 +895,14 @@ class BigQmtRpcHandlers:
         now = time.time()
         with self._credit_account_lock:
             if self._credit_account_inflight:
-                return False, "a query is already in flight"
+                # 兜底：inflight 卡住超过一个最小间隔就当它丢了，重新放行。
+                # 官方说「前一个查询还在进行中，后面的会提前返回」，所以重问
+                # 最坏也就是提前返回；而卡死是永久失去这条通道。
+                stuck_for = now - self._credit_account_asked
+                if stuck_for < self.credit_account_min_interval_seconds:
+                    return False, ("a query is already in flight (%.1fs)"
+                                   % stuck_for)
+                self._credit_account_inflight = False
             since = now - self._credit_account_asked
             if self._credit_account_asked and since < self.credit_account_min_interval_seconds:
                 return False, ("rate limited: %.1fs since the last query, minimum %.1fs"
@@ -907,13 +944,24 @@ class BigQmtRpcHandlers:
                     break
                 if not self._credit_account_inflight:
                     break
-            # sleep 让出 GIL，回调线程才拿得到 —— busy-wait 会把它锁死在门外。
+            # sleep 让出 GIL —— 但如果回调本来就要走这条线程，让出 GIL 也没用，
+            # 见 CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS 上面的说明。
             time.sleep(0.02)
+        waited = round(time.time() - (deadline - wait_seconds), 3)
         with self._credit_account_lock:
+            # 等不到就把 inflight 放掉。原来只有「回调到达」和「func 抛异常」
+            # 两条路会清它 —— 超时路径没人清，于是**一次回调丢失就把这条通道
+            # 永久卡死**：之后每次调用都撞 "a query is already in flight"，再也
+            # 发不出去。放掉的代价只是可能重复问一次柜台，而 30s 最小间隔还在。
+            timed_out = (self._credit_account_inflight
+                         and not (self._credit_account_stamp > stamp_before))
+            if timed_out:
+                self._credit_account_inflight = False
             rows = list(self._credit_account_rows)
             stamp = self._credit_account_stamp
             error = self._credit_account_error
             seq = self._credit_account_seq
+            callbacks = self._credit_account_callbacks
         return {
             "rows": rows,
             "count": len(rows),
@@ -925,6 +973,18 @@ class BigQmtRpcHandlers:
             "seq": seq,
             "error": error,
             "callback_bound": callable(self.qmt_api.get("query_credit_account")),
+            # 这两个才是能定位问题的：callbacks_seen=0 说明 QMT 压根没回调
+            # （等太短？账户不支持？回调没挂上？），>0 说明回调通了、问题在别处。
+            "callbacks_seen": callbacks,
+            "waited_seconds": waited,
+            # 回调实际落在哪条线程上。这一条能证伪上面那个「回调走主线程、
+            # 被我的等待堵住」的假设 —— 不用再猜。
+            "callback_thread": self._credit_account_callback_thread,
+            # 这次是不是等超时并把 inflight 放掉了
+            "inflight_released": bool(timed_out),
+            "note": ("默认不等回调：查询已发出，结果随后落进缓存，下一次调用即可"
+                     "取到（handler 跑在 adjust 主线程上，等待可能把回调堵在门外）"
+                     if wait_seconds == 0 else ""),
         }
 
     def _describe_probe_rows(self, rows):
