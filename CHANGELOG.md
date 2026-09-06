@@ -3,6 +3,22 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
 
+## [0.3.23] - 2026-09-06
+
+### 修复
+
+- **无 redis / 纯 zmq 部署此前跑的是旧 transport**：`bigqmt_no_redis/zmq_transport.py` 是手工维护的自包含分支（内联了 redis 依赖、去掉服务发现，好在拒绝 `import redis` 的 QMT 沙箱里加载），**没有生成脚本，所以从 7 月 29 日起悄悄漂了** —— 源码 transport 后来拿到 #177（回复入队即唤醒 router，交易查询 1500→605ms）和 #186（每线程一个 DEALER，多线程并发不再排队），这个分支一个都没跟上。而单文件构建器正是**用这个分支覆盖**源码 transport，所以最需要低延迟的纯 zmq 部署，恰恰在跑最旧的那份。
+
+  已从当前源码重新生成（同样的去 redis 变换），现在带上 #177、#186、卡顿看门狗和 reply-residency 统计。验证：断掉 redis 也能独立导入、无 redis 命名的 import 残留、no-redis 单文件构建内联了新代码并编译通过。
+
+  **影响范围**：`bigqmt_no_redis/` 不在 PyPI 包里（只打 `bigqmt_signal_trader*` / `bigqmt_backtest*` / `xtquant*`），所以 pip 安装的客户端不受此条影响；受影响的是用无 redis 单文件构建、或直接部署 `bigqmt_no_redis/` 目录的人。
+
+### 文档
+
+- **Windows 用户怎么拿到 Redis 服务**（#200）：依赖表里的 `redis` 是 redis-py **包**不是 Redis **服务**，全仓库此前没写过服务端 Redis 在 Windows 上怎么来。README「环境要求与依赖安装」新增 C 节：redis-windows 社区发行版地址（免 WSL）、最小 `redis.conf`、对应的 `BIGQMT_REDIS_CONFIG` 填法。**安全提示写在同一段**（不挪后面）：RPC 层无鉴权、队列名 `bigqmt:rpc:queue:<账号>` 含账号不算秘密、`rpc_allow_order_methods=True` 会暴露下单撤单，所以 `requirepass` + `bind 127.0.0.1` 是底线。只写文档、不分发第三方二进制。
+
+- **赞赏码**：README 讨论组一节后加了自愿赞赏的微信码，不影响任何功能。
+
 ## [0.3.22] - 2026-09-05
 
 ### 新增
