@@ -15,6 +15,14 @@
 
 ### 修复
 
+- **`query_credit_account` 的等待反而堵死了回调，且一次回调丢失就把通道永久卡死**（#202 后续，两个真 bug）：入口捕获修好后，真两融账户上仍然 `query_issued: true`、等满 8 秒、拿不到数据，而同一台机器在大 QMT 里直接调回调是能触发的。
+
+  **其一：等待可能堵住回调本身。** handler 跑在 adjust 主线程上（必须如此，否则拿不到交易上下文），原来它在**同一条线程上** sleep 轮询等回调。QMT 若把 `credit_account_callback` 投递到主线程（`order_callback` 走 C++ 线程，不能照搬），那就是用等待堵住了唯一能送达的路。默认改成**不等**：发出去即返回，回调随后落进缓存，下一次调用取到。这在两种假设下都安全；想等的人显式传 `wait_seconds`。实测默认调用从「等满 8 秒」变成 104ms 返回。
+
+  **其二：`_credit_account_inflight` 只在「回调到达」和「func 抛异常」两处被清，超时路径没人清** —— 回调丢一次，之后每次调用都撞 `a query is already in flight`，**这条通道永久失效**。现在超时释放（信封报 `inflight_released`），外加兜底：卡住超过一个最小间隔就当它丢了。
+
+  同时把「回调落在哪条线程上」记下来（`callback_thread` / `last_callback_thread`）—— 这是个事实问题，记下来就不用继续猜。
+
 - **信用账户回调的成功与失败都不出声，「QMT 没回调」和「回调来了没送到」分不开**（#202 后续）：入口捕获修好后，实盘上出现 `callback_bound: true`、`query_issued: true`，但 `fresh: false` 没数据。而 `credit_account_callback` 无论成功还是失败都静默返回 —— 又是「a failed operation looks exactly like one that never ran」，这次栽在自己的新代码上。
 
   现在每次回调都留痕：handlers 记 `callbacks_seen` 计数；转交不成功时（没有 RPC service、handlers 太旧没有 `note_credit_account`）**大声报出来**而不是默默 `return False`；归一化失败也照样计数 —— 回调来过就是来过，不能算成「没回调」。`query_credit_account` 的信封新增 `callbacks_seen` 和 `waited_seconds`，`probe_capabilities` 新增 `credit_callback` 一段（不发查询也能看）。体检报告把这两种成因分开写进结论，并把默认等待从 3 秒放宽到 8 秒（查柜台可能更慢，而这是只读查询，等久一点没有代价）。

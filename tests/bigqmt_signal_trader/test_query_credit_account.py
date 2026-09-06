@@ -74,7 +74,8 @@ class QueryCreditAccountTest(unittest.TestCase):
 
         handlers = _handlers(query_credit_account)
         handlers_box["h"] = handlers
-        out = handlers.handle("query_credit_account", {})
+        # 显式要求等待：默认是 0（不堵 adjust 主线程），这条测的正是等待路径
+        out = handlers.handle("query_credit_account", {"wait_seconds": 2})
 
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0][0], "acct")
@@ -240,6 +241,76 @@ class QueryCreditAccountTest(unittest.TestCase):
         handlers.note_credit_account(1, _Exploding())
         probe = handlers.handle("probe_capabilities", {})["credit_callback"]
         self.assertGreaterEqual(probe["callbacks_seen"], 1)
+
+    def test_default_does_not_block_the_adjust_thread(self):
+        """默认不等回调 —— handler 跑在 adjust 主线程上，等待可能把回调堵在门外。"""
+        from bigqmt_signal_trader.redis_rpc import CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS
+
+        self.assertEqual(CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS, 0.0)
+
+        started = time.time()
+        out = _handlers(lambda *a: None).handle("query_credit_account", {})
+        self.assertLess(time.time() - started, 0.5)
+        self.assertTrue(out["query_issued"])
+        self.assertIn("下一次调用", out["note"])
+
+    def test_result_is_available_on_the_next_call(self):
+        """不等的代价只是多一次调用：回调随后落下，第二次就取到。"""
+        handlers_box = {}
+        pending = []
+
+        def query_credit_account(account_id, seq, context_info):
+            pending.append(seq)          # 模拟回调晚于 handler 返回
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+        handlers.credit_account_min_interval_seconds = 0.0
+
+        first = handlers.handle("query_credit_account", {})
+        self.assertEqual(first["count"], 0)
+
+        handlers.note_credit_account(pending[0], _CreditResult())   # 回调后到
+
+        second = handlers.handle("query_credit_account", {})
+        self.assertEqual(second["count"], 1)
+        self.assertEqual(second["rows"][0]["m_dTotalDebt"], 12345.67)
+
+    def test_a_lost_callback_does_not_wedge_the_channel_forever(self):
+        """inflight 原来只在回调到达/抛异常时清 —— 超时没人清，一次丢失就永久卡死。"""
+        calls = []
+        handlers = _handlers(lambda a, s, c: calls.append(s))
+        handlers.credit_account_min_interval_seconds = 0.0
+
+        first = handlers.handle("query_credit_account", {"wait_seconds": 0.1})
+        self.assertTrue(first["query_issued"])
+        self.assertTrue(first["inflight_released"])
+
+        second = handlers.handle("query_credit_account", {"wait_seconds": 0.1})
+        self.assertTrue(second["query_issued"],
+                        "回调丢一次就再也发不出去了：%s" % second["not_issued_reason"])
+        self.assertEqual(len(calls), 2)
+
+    def test_a_stuck_inflight_is_released_after_the_min_interval(self):
+        """兜底：inflight 卡住超过一个最小间隔就当它丢了。"""
+        calls = []
+        handlers = _handlers(lambda a, s, c: calls.append(s))
+        handlers.credit_account_min_interval_seconds = 0.0
+        handlers._credit_account_inflight = True
+        handlers._credit_account_asked = time.time() - 999
+
+        out = handlers.handle("query_credit_account", {})
+        self.assertTrue(out["query_issued"])
+        self.assertEqual(len(calls), 1)
+
+    def test_callback_thread_is_recorded_so_the_hypothesis_is_testable(self):
+        """回调落在 adjust 线程还是 C++ 线程，是个事实问题 —— 记下来别猜。"""
+        handlers = _handlers(lambda *a: None)
+        handlers.note_credit_account(1, _CreditResult())
+
+        probe = handlers.handle("probe_capabilities", {})["credit_callback"]
+        self.assertTrue(probe["last_callback_thread"])
+        out = handlers.handle("query_credit_account", {})
+        self.assertTrue(out["callback_thread"])
 
     def test_method_is_whitelisted_and_deferred_to_the_main_thread(self):
         from bigqmt_signal_trader.redis_rpc import (
