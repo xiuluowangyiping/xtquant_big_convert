@@ -7,6 +7,14 @@
 
 ### 修复
 
+- **直连的两融 `get_*` 查询恒返回空，而调同一个 QMT 函数的 `query_*` 孪生方法有数据**：一位有两融账户的用户跑 `tools/credit_api_report.py` 回报，同一次运行里 `query_stk_compacts` 52 行 / `query_credit_subjects` 71002 行 / `query_credit_slo_code` 50 行，而 `get_unclosed_compacts` / `get_assure_contract` / `get_enable_short_contract` 全是 0 行。两边的 handler **逐字节相同**，账号相同，底层 QMT 函数也是同一个 —— 唯一的差别是 `query_*` 在 `LISTENER_DEFERRED_METHODS` 里（走 adjust 主线程），直连的不在（走后台 listener 线程）。
+
+  这正是 `get_ipo_data` 早就踩过并修掉的坑，它的注释原文就是「交易类查询, 需主线程上下文（后台线程返回空）」—— 当时只修了它一个，孪生方法漏网。现在把所有要交易上下文的 QMT 全局函数补进 defer 名单：`get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` / `get_closed_compacts` / `get_debt_contract` / `get_option_subject_position` / `get_comb_option` / `get_new_purchase_limit` / `get_hkt_exchange_rate`。行情读（`get_ticks` / `get_market_data*` / `get_option_list` / `get_main_contract` …）保持 inline 不动，defer 会白搭上一个 adjust 间隔的延迟；用例同时钉住这两侧。
+
+  **有一处尚未解释**：`probe_capabilities` 同样不在 defer 名单里（和直连 `get_*` 属同一集合），却在那份报告里拿到了 71002/50/52 行。按线程解释它应该也是空的。修复不依赖这个解释成立 —— 它做的是让孪生方法对齐到那条**已被证明能出数**的路径。
+
+- **`get_hkt_exchange_rate` 一个参数都没传**：官方签名是 `get_hkt_exchange_rate(accountID, accountType)`（6.18，`accountType` 须为 `HUGANGTONG` / `SHENGANGTONG`），handler 调的是零参数版本。`_call_qmt_global` 会把 `TypeError` 吞掉返回 `{}`，从客户端看和「这台终端没有港股通」一模一样。现在按签名传参，`account_type` 可用参数覆盖（默认 `HUGANGTONG`），并改走 `_call_qmt_mapping` —— 它返回的是 dict（买卖参考汇率），过 `_normalize_detail_rows` 会把值全丢掉，和 #96 的 `get_ipo_data` 同一个形状。
+
 - **两融账户调 `query_credit_detail` 恒为空列表**（#201）：handler 把它路由到了 `get_debt_contract`。两处都不对 —— 那是「负债合约明细」（一张张合约），不是信用账户对象；而且官方参考 6.17 已把它标记【已弃用】。于是没有未了结负债的两融账户必然拿到 `[]`，有负债的也只拿到合约行，永远拿不到维持担保比例 / 授信额度那一组字段。
 
   改走 `get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')` → `CCreditAccountDetail`（官方参考 3.14），也就是本仓 `docs/MiniQMT_2_BigQMT-Skill/api_mapping.md:83` 一直记着、而代码一直没对上的那条映射。账户类型强制 `CREDIT`，不跟部署配置走：账户类型是「问哪本账」，不是「这台部署下单用哪本账」，否则按 `STOCK` 配置的部署永远查不到自己的信用账户。
