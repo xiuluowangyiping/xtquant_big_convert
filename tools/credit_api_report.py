@@ -84,6 +84,21 @@ CREDIT_CONTRACT_CHECKS = [
      "get_debt_contract(accId)", {}),
 ]
 
+# #204 一并推回主线程的其余交易类全局函数。不是两融，但和上面那批是同一个
+# 修复：它们原来都跑在后台 listener 线程上，而 QMT 交易类查询在主策略线程之外
+# 返回「行数对、字段全空」的对象。放进报告，一次跑完能把 #204/#205 全测到。
+OTHER_TRADE_GLOBAL_CHECKS = [
+    ("get_option_subject_position", "期权标的持仓",
+     "get_option_subject_position(accId)", {}),
+    ("get_comb_option", "组合期权持仓", "get_comb_option(accId)", {}),
+    ("get_new_purchase_limit", "新股申购额度", "get_new_purchase_limit(accId)", {}),
+    ("get_ipo_data", "新股数据（早就 defer 的，做对照）", "get_ipo_data(type)", {}),
+    # #205：官方签名是 (accountID, accountType)，原来一个参数都没传，
+    # _call_qmt_global 把 TypeError 吞掉返回空 —— 从客户端看和「没开港股通」一样。
+    ("get_hkt_exchange_rate", "港股通汇率【#205 修复的】",
+     "get_hkt_exchange_rate(accId, accountType)", {}),
+]
+
 # 对照组：不是两融接口，用来确认桥本身是活的。如果这几个也空，那问题不在两融。
 CONTROL_CHECKS = [
     ("ping", "存活/版本", "-", {}),
@@ -202,6 +217,15 @@ def summarize_rows(rows, full, keys_are_data=False):
                  and not isinstance(first.get(k), bool)
                  and first.get(k) != 0]
     out["non_zero_numeric_fields"] = populated
+    # 行数不等于有数据。QMT 交易类查询跑在主策略线程之外时，返回的是**行数对、
+    # 字段全空**的对象（实测：get_asset 移出 defer 名单后照样回 5 个键，值全是
+    # None）。只看行数会把这种情况判成「有数据」—— 那正是这份报告最该拦住的
+    # 误导（#204）。0 是合法值（没有负债就是 0），只有 None/"" 才算没拿到。
+    present = [k for k in fields
+               if first.get(k) is not None and first.get(k) != ""]
+    out["populated_fields"] = len(present)
+    # 有字段、但每个字段都没值 —— 这才是跑错线程的签名。零字段是没数据。
+    out["hollow"] = bool(fields) and not present
     out["all_numeric_zero"] = (not populated) and any(
         isinstance(first.get(k), (int, float)) and not isinstance(first.get(k), bool)
         for k in fields)
@@ -222,7 +246,10 @@ def normalize_result(result):
         if "rows" in result and isinstance(result["rows"], list):
             extra = dict((k, v) for k, v in result.items() if k != "rows")
             return result["rows"], extra
-        return [result], {}
+        # 空 dict 是「没数据」，不是「一行空数据」。当成一行的话，下面的
+        # hollow 判据（字段全空）会对它成立 —— 实跑第一次就把已经 defer 的
+        # get_ipo_data 误报成跑错线程了。
+        return ([result] if result else []), {}
     if isinstance(result, (list, tuple)):
         return list(result), {}
     return [result], {}
@@ -264,6 +291,9 @@ def verdict_for(entry):
         return "报错", entry.get("error", "")
     envelope = entry.get("envelope") or {}
     if entry.get("row_count"):
+        if entry.get("hollow"):
+            return "有行但字段全空", ("行数对、字段名齐全、值全是 None —— QMT 交易类"
+                                     "查询跑在主策略线程之外就是这样，看 thread_routing")
         if entry.get("all_numeric_zero"):
             return "有行但数值全为 0", "字段回来了，值都是 0 —— 可能是没数据，也可能是没读到"
         key_nz = entry.get("key_credit_fields_non_zero")
@@ -312,6 +342,8 @@ def render_text(report):
 
     for title, key in (("信用账户明细（这次报告的重点）", "credit_account"),
                        ("负债合约 / 标的", "credit_contracts"),
+                       ("其余交易类全局函数（#204 一并推回主线程 / #205）",
+                        "other_trade_globals"),
                        ("对照组（非两融，用来确认桥本身是活的）", "control")):
         add("-" * 72)
         add(title)
@@ -350,6 +382,17 @@ def render_text(report):
             add("")
             add("  这台终端没有绑上的全局函数: %s" % ", ".join(missing))
     add("")
+
+    routing = (report.get("probe") or {}).get("thread_routing") or {}
+    if routing.get("available"):
+        add("-" * 72)
+        add("线程路由（QMT 交易类查询在主策略线程之外返回空行/空字段）")
+        add("-" * 72)
+        add("  process_in_listener : %s" % routing.get("process_in_listener"))
+        add("  listener 方法数     : %s" % routing.get("listener_method_count"))
+        for name, where in sorted((routing.get("sample") or {}).items()):
+            add("  %-28s %s" % (name, where))
+        add("")
 
     add("-" * 72)
     add("信用委托类型常量（静态核对，没有下过单）")
@@ -423,6 +466,12 @@ def build_conclusions(report):
     else:
         out.append("信用账户明细两条路都空。请把 probe_capabilities 那一段一起贴上来。")
 
+    hollow = sorted(m for m, e in by_method.items() if e.get("hollow"))
+    if hollow:
+        out.append("这些接口返回了行、但字段全是 None：%s —— 几乎可以肯定是跑在"
+                   "后台线程上了（QMT 交易类查询要主策略线程），把 thread_routing "
+                   "那一段贴上来。" % ", ".join(hollow))
+
     broken = [m for m, e in by_method.items() if not e.get("ok")]
     if broken:
         out.append("直接报错的接口: %s" % ", ".join(sorted(broken)))
@@ -494,7 +543,8 @@ def main(argv=None):
             "read_only": True,
             "orders_placed": 0,
         },
-        "checks": {"credit_account": [], "credit_contracts": [], "control": []},
+        "checks": {"credit_account": [], "credit_contracts": [],
+                   "other_trade_globals": [], "control": []},
     }
 
     report["meta"]["bridge_version"] = handshake.get("version", "?")
@@ -511,6 +561,10 @@ def main(argv=None):
     for method, label, backend, params in CREDIT_CONTRACT_CHECKS:
         print("  ->", method)
         report["checks"]["credit_contracts"].append(
+            run_check(call, method, label, backend, params, args.full))
+    for method, label, backend, params in OTHER_TRADE_GLOBAL_CHECKS:
+        print("  ->", method)
+        report["checks"]["other_trade_globals"].append(
             run_check(call, method, label, backend, params, args.full))
     for check in CONTROL_CHECKS:
         method, label, backend, params = check[:4]

@@ -156,6 +156,22 @@ LISTENER_DEFERRED_METHODS = {
     "query_credit_assure",
     "query_appointment_info",
     "get_ipo_data",   # 8-28: 交易类查询, 需主线程上下文 (后台线程返回空)
+    # get_ipo_data 上面那条注释适用于所有走 QMT 交易类全局函数的查询，当时只
+    # 修了它一个。真两融账户的体检报告把漏网的挑了出来：同一次运行里
+    # query_stk_compacts -> 52 行、query_credit_subjects -> 71002 行、
+    # query_credit_slo_code -> 50 行，而调同一个 QMT 函数的直连 get_* 全是 0 行。
+    # 两边 handler 逐字节相同、账号相同，唯一差别就是 query_* 在这张表里、
+    # 直连的不在，于是后者跑在后台 listener 线程上 —— 正是 get_ipo_data 当年
+    # 踩的那个坑。孪生方法必须待在同一条线程路径上（#204）。
+    "get_assure_contract",
+    "get_enable_short_contract",
+    "get_unclosed_compacts",
+    "get_closed_compacts",
+    "get_debt_contract",
+    "get_option_subject_position",
+    "get_comb_option",
+    "get_new_purchase_limit",
+    "get_hkt_exchange_rate",
     "query_smt_secu_info",
     "query_smt_secu_rate",
     "get_value_by_order_id",
@@ -780,9 +796,9 @@ class BigQmtRpcHandlers:
                                 self._configured_account_type(self.account_id)) or []
                 else:
                     rows = func(self.account_id) or []
-                info["credit_probe"][name] = {
-                    "available": True, "ok": True, "rows": len(rows),
-                }
+                report = {"available": True, "ok": True}
+                report.update(self._describe_probe_rows(rows))
+                info["credit_probe"][name] = report
             except Exception as exc:
                 info["credit_probe"][name] = {
                     "available": True, "ok": False,
@@ -793,6 +809,7 @@ class BigQmtRpcHandlers:
         # 3 = 信用。#201 的报告只看到「空列表」，无从判断是哪一种。
         info["credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"] = \
             self._probe_credit_account_object()
+        info["thread_routing"] = self._probe_thread_routing()
         info["sector_probe"] = self._probe_sector_channels()
         info["order_watch"] = self._probe_order_watch()
         info["reply_residency"] = self._probe_reply_residency()
@@ -904,6 +921,85 @@ class BigQmtRpcHandlers:
             "callback_bound": callable(self.qmt_api.get("query_credit_account")),
         }
 
+    def _describe_probe_rows(self, rows):
+        """行数不等于有数据 —— 这条探测自己踩过这个坑。
+
+        QMT 的交易类查询跑在主策略线程之外时，返回的不是空列表，而是**行数
+        对、字段全空**的对象（本机实测：把 get_asset 移出 defer 名单，它照样
+        返回 5 个键，但 cash / total_asset / frozen_cash / market_value 全是
+        None）。原来这里只报 len(rows)，于是在一份真两融账户的报告里给出了
+        `ok: true, rows: 71002`，而同一次运行里走 handler 的同一个函数是 0 行
+        —— 探测反过来把人带偏了（#204）。
+
+        所以这里过一遍 handler 用的同一个归一化，再看**字段里到底有没有东西**。
+        CLAUDE.md 那句「Verify the meaning, not the shape」，说的就是这个。
+        """
+        report = {"rows": len(rows)}
+        try:
+            normalized = _normalize_detail_rows(rows)
+        except Exception as exc:
+            report["normalize_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            return report
+        report["normalized_rows"] = len(normalized)
+        first = normalized[0] if normalized else None
+        if not isinstance(first, dict):
+            return report
+        report["fields"] = len(first)
+        # None / "" 才算「没拿到」。0 是合法值（没有负债就是 0），不能当空看。
+        present = [key for key, value in first.items()
+                   if value is not None and value != ""]
+        report["populated_fields"] = len(present)
+        # first 必须真的有字段。零字段是「没数据」，不是「空行」—— 判错的话
+        # 一个返回 {} 的接口会被报成跑错线程（本机实跑第一次就误报了）。
+        if first and not present:
+            # 行在、字段全空 —— 这就是跑错线程的签名，必须说出来，不能让
+            # 一个 rows=71002 看着像成功。
+            report["hollow"] = True
+            report["note"] = ("行数对但字段全空 —— QMT 交易类查询在主策略线程"
+                              "之外就是这个样子，查 thread_routing")
+        return report
+
+    def _probe_thread_routing(self):
+        """哪些方法跑在后台 listener 线程上，哪些被推回 adjust 主线程。
+
+        QMT 的交易类查询在主策略线程之外返回空 —— 这是本项目最重要的一条约束，
+        也是 #204 的症结：同一个 QMT 函数，走 adjust 线程有 71002 行，走 listener
+        线程 0 行。而远端报告里看不到路由配置，只能靠猜。这一项把它摊开。
+
+        `sample` 里给的是几个有代表性的方法，不是全集：全集有一百多个，塞进
+        报告没人看得完。
+        """
+        service = getattr(self, "rpc_service", None)
+        if service is None:
+            return {"available": False,
+                    "note": "handlers has no rpc_service backref"}
+        report = {
+            "available": True,
+            "process_in_listener": bool(getattr(service, "process_in_listener", False)),
+        }
+        listener_methods = getattr(service, "listener_methods", None)
+        if listener_methods is not None:
+            try:
+                report["listener_method_count"] = len(listener_methods)
+            except Exception:
+                pass
+        decide = getattr(service, "_should_process_in_listener", None)
+        if callable(decide):
+            sample = {}
+            for name in ("ping", "get_ticks", "get_market_data_ex",
+                         "query_credit_detail", "query_stk_compacts",
+                         "query_credit_subjects", "get_unclosed_compacts",
+                         "get_assure_contract", "get_enable_short_contract",
+                         "get_ipo_data", "get_new_purchase_limit",
+                         "probe_capabilities", "get_asset", "get_positions"):
+                try:
+                    sample[name] = ("listener_thread" if decide({"method": name})
+                                    else "adjust_thread")
+                except Exception as exc:
+                    sample[name] = "unknown: %s" % exc.__class__.__name__
+            report["sample"] = sample
+        return report
+
     def _probe_credit_account_object(self):
         """Read-only probe of the credit account object behind query_credit_detail.
 
@@ -912,21 +1008,27 @@ class BigQmtRpcHandlers:
         answer can be told apart from a non-credit account, which the bare
         [] the reporter saw could not (#201).
         """
+        # getattr 而不是属性直取：不是每种 gateway 都有这个属性（dry-run 的就
+        # 没有），而 probe_capabilities 是诊断接口，它自己崩掉是最坏的结果。
         gateway = self.order_gateway
-        if gateway is None or gateway.get_trade_detail_data is None:
+        get_detail = getattr(gateway, "get_trade_detail_data", None)
+        if gateway is None or not callable(get_detail):
             return {"available": False}
         try:
-            rows = _normalize_detail_rows(
-                gateway.get_trade_detail_data(
-                    self.account_id, "CREDIT", "ACCOUNT", "")) or []
+            raw = get_detail(self.account_id, "CREDIT", "ACCOUNT", "") or []
         except Exception as exc:
             return {"available": True, "ok": False,
                     "error": "%s: %s" % (exc.__class__.__name__, exc)}
-        report = {"available": True, "ok": True, "rows": len(rows)}
+        report = {"available": True, "ok": True}
+        report.update(self._describe_probe_rows(raw))
+        rows = _normalize_detail_rows(raw) or []
         if rows and isinstance(rows[0], dict):
             report["broker_type"] = rows[0].get("m_nBrokerType")
+            # 键在不等于值在。跑错线程时字段名一个不少、值全是 None，用
+            # `key in row` 判断会报 has_credit_fields=True，而调用方拿到的
+            # 是一行 null —— 和 rows=71002 那个误导是同一个错误（#204）。
             report["has_credit_fields"] = any(
-                key in rows[0] for key in
+                rows[0].get(key) is not None for key in
                 ("m_dPerAssurescaleValue", "m_dFinMaxQuota", "m_dSloMaxQuota"))
         return report
 
@@ -1650,7 +1752,14 @@ class BigQmtRpcHandlers:
         return self._call_qmt_global("get_comb_option", self._request_account_id(params))
 
     def _handle_get_hkt_exchange_rate(self, params):
-        return self._call_qmt_global("get_hkt_exchange_rate")
+        # 官方签名 get_hkt_exchange_rate(accountID, accountType)，accountType 须为
+        # HUGANGTONG / SHENGANGTONG（6.18）。原来一个参数都没传，而 _call_qmt_global
+        # 会把 TypeError 吞掉返回 {} —— 又一次静默返回空，从客户端看和「这台终端
+        # 没有港股通」一模一样（#205）。
+        account_type = str(params.get("account_type")
+                           or params.get("accountType") or "HUGANGTONG").strip().upper()
+        return self._call_qmt_mapping(
+            "get_hkt_exchange_rate", self._request_account_id(params), account_type)
 
     def _handle_download_history_data(self, params):
         """download_history_data is a QMT global function (issue #32).
@@ -2619,6 +2728,13 @@ class RedisPubSubRpcService:
         # strategy file so a reload picks it up without a restart.
         try:
             self.handlers.rpc_transport = transport
+        except Exception:
+            pass
+        # 同理，让 handlers 能报出「这个方法会跑在哪条线程上」。#204 查了半天
+        # 才发现症结是线程路由，而远端报告里恰恰看不到这个 —— 一个只能远程
+        # 诊断的部署，把决定行为的开关藏起来就等于让人猜。
+        try:
+            self.handlers.rpc_service = self
         except Exception:
             pass
         # Route inbound raw payloads through the service's dispatch (which
