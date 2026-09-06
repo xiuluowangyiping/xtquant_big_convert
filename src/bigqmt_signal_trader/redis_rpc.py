@@ -225,6 +225,8 @@ DEFAULT_ORDER_STRATEGY_NAME = "bigqmt_rpc"
 # 如果前面的查询正在进行中，后面的查询将会提前返回。本函数从服务器查询数据，
 # 建议平均查询时间间隔 30s 一次，不可频繁调用。」所以桥这边自己限流，客户端
 # 想怎么轮询都不会把柜台打爆（#202）。
+# hollow 告警的最小间隔。跑错线程时每一次查询都会 hollow，不节流日志会被刷爆。
+HOLLOW_WARNING_INTERVAL_SECONDS = 60.0
 CREDIT_ACCOUNT_MIN_INTERVAL_SECONDS = 30.0
 # 一次 RPC 里最多等回调多久。回调走 QMT 的 C++ 线程，handler 在 adjust 主线程
 # 上；这里的等待用 sleep 轮询让出 GIL，回调才落得下来。默认给得短，因为拿不到
@@ -573,6 +575,10 @@ class BigQmtRpcHandlers:
         # Server-side diagnostic for silent failures (e.g. passorder submitted
         # but order not found in system). Surfaced to client via server_error.
         self._last_server_error = ""
+        # 上一次 hollow 告警的时间戳。节流是必须的：一个跑错线程的部署会让
+        # **每一次**交易类查询都 hollow，不节流的话日志会被刷爆（#139 就是
+        # 一行写了 16 次那种教训）。
+        self._last_hollow_warning_at = 0.0
         # 信用账户的「查柜台」通道（#202）。query_credit_account 是异步的：结果
         # 只从 credit_account_callback 出来，所以这里存最后一次回调的结果，由
         # note_credit_account 填。官方 6.13 明说「只能有一个查询」「建议 30s 一
@@ -1536,6 +1542,50 @@ class BigQmtRpcHandlers:
     # 无该权限/函数未注入时降级为空列表。
     # ------------------------------------------------------------------
 
+    def _warn_if_hollow(self, source, rows):
+        """交易类响应「行数对、字段全空」时大声报出来，别让它静默过去。
+
+        QMT 的交易类查询跑在主策略线程之外时，返回的不是空列表，而是行数对、
+        字段全是 None 的对象（本机实测：get_asset 移出 defer 名单后照样回 5 个
+        键，值全空）。从客户端看像「这个账户没钱」，不像调用失败 —— #204 就是
+        这么在线上静默了几个月。
+
+        静态闸（tests/.../test_trade_context_deferral_guard.py）保证我们**自己**
+        不写漏，但挡不住「换一家券商行为不一样」。所以运行时再看一眼：真出现了
+        就记一条 warning，把函数名和当前线程名一起写出来，让「每家不一样」成为
+        被观测到的事实，而不是我们猜出来的。
+
+        只告警、不改路由：defer 实测只要 2.5-3.0ms，而猜错方向的代价是静默返回
+        错数据，两边完全不对等；而且「跑错线程」和「这个账户真没数据」从返回值
+        上分不开，据此自动切换只会把一次误判固化下来。
+        """
+        if not rows:
+            return rows
+        first = rows[0] if isinstance(rows, (list, tuple)) else rows
+        if not isinstance(first, dict) or not first:
+            return rows
+        if any(value is not None and value != "" for value in first.values()):
+            return rows
+        now = time.time()
+        if now - self._last_hollow_warning_at < HOLLOW_WARNING_INTERVAL_SECONDS:
+            return rows
+        self._last_hollow_warning_at = now
+        try:
+            thread_name = threading.current_thread().name
+        except Exception:
+            thread_name = "?"
+        try:
+            from .logging_setup import get_logger
+            get_logger("rpc").warning(
+                "%s returned %d row(s) with every field empty, on thread %r. "
+                "QMT trade-context queries answer this way off the main strategy "
+                "thread -- the call did NOT fail, the data is simply not there. "
+                "Check probe_capabilities thread_routing (#204).",
+                source, len(rows), thread_name)
+        except Exception:
+            pass
+        return rows
+
     def _call_qmt_global(self, func_name, *args, **kwargs):
         """Call a QMT runtime-injected global function, returning [] on failure.
 
@@ -1548,7 +1598,8 @@ class BigQmtRpcHandlers:
         if func is None:
             return []
         try:
-            return _normalize_detail_rows(func(*args, **kwargs))
+            return self._warn_if_hollow(func_name,
+                                        _normalize_detail_rows(func(*args, **kwargs)))
         except Exception:
             return []
 
@@ -1666,7 +1717,9 @@ class BigQmtRpcHandlers:
                             else getattr(gateway, "account_type", "STOCK"))
         try:
             rows = gateway.get_trade_detail_data(account_id, account_type, detail_type, strategy_name)
-            return _normalize_detail_rows(rows)
+            return self._warn_if_hollow(
+                "get_trade_detail_data(%s,%s)" % (account_type, detail_type),
+                _normalize_detail_rows(rows))
         except Exception:
             return []
 

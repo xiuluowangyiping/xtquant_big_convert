@@ -5,6 +5,14 @@
 
 ## [未发布]
 
+### 新增
+
+- **两道闸，堵住「交易类查询跑到后台线程上」这一整类 bug**：`get_trade_detail_data` 在主策略线程之外返回空是本项目最重要的一条约束，但 `LISTENER_DEFERRED_METHODS` 一直是**手工维护**的集合，没有任何东西检查「这个 handler 碰了交易上下文，它在不在名单里」。#204 就是这么漏的：`get_ipo_data` 当年因为同样的症状被单独修好并 defer，同批的 9 个孪生方法一个都没跟上，在线上静默了几个月。
+
+  **静态闸**（`tests/bigqmt_signal_trader/test_trade_context_deferral_guard.py`）：用 AST 扫出所有碰交易上下文的 handler（含经私有方法的传递闭包，也认 `self.qmt_api.get(...)` 直接取的写法），挨个检查在不在 defer 名单里。漏一个就红。豁免必须写进 `DELIBERATELY_INLINE` 并说明理由 —— 让「不 defer」成为需要解释的决定而不是忘了。当前三条豁免：`probe_capabilities`（诊断接口，adjust 卡住时更要能答）、`download_history_data` / `download_history_data2`（下载耗时长，defer 会卡住主线程）。对 #204 修复前的代码跑这道闸是红的 —— 它当初就能拦住。
+
+  **运行时告警**：静态闸保证我们自己不写漏，但挡不住「换一家券商行为不一样」。所以交易类响应回来「行数对、字段全空」时记一条 warning，把 QMT 函数名和当前线程名一起写出来，60 秒节流（跑错线程时每次查询都 hollow，不节流会刷爆日志，#139 的教训）。**只告警、不自动改路由**：defer 实测只要 2.5-3.0ms（和 inline 的行情读 3.3ms 同量级），而猜错方向的代价是静默返回错数据，两边完全不对等；何况「跑错线程」和「这个账户真没数据」从返回值上分不开，据此自动切换只会把一次误判固化下来。让「每家不一样」成为被观测到的事实，而不是被猜测后自动应对的。
+
 ### 修复
 
 - **三个 QMT 全局函数的参数写错，外加两个返回形状用错，全部静默返回空**（#207）：QMT 全局函数的映射是纯手写的，没有任何东西校验它和官方签名对不对。用 AST 把所有调用点扫出来和官方参考比对，查出：`get_value_by_order_id` 只传了 1 个参数（签名要 4 个）、`get_last_order_id` 只传了 1 个（要 3-4 个）、`get_history_trade_detail_data` 传了 4 个且把 `detail_type` 塞到了 `strAccountType` 的位置（要 5 个，和 #96 同一个形状）。全部被 `_call_qmt_global` 的 `except: return []` 吞掉。
