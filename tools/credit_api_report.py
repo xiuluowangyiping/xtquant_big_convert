@@ -525,8 +525,8 @@ def main(argv=None):
     parser.add_argument("--out", default=".", help="报告输出目录")
     parser.add_argument("--full", action="store_true",
                         help="报告里带上原始数值（默认省略，便于直接贴 issue）")
-    parser.add_argument("--wait", type=float, default=8.0,
-                        help="查柜台那条路等回调的秒数（默认 8）。查柜台可能比几秒还慢，而这是只读查询，等久一点没有代价")
+    parser.add_argument("--wait", type=float, default=0.0,
+                        help="查柜台那条路等回调的秒数（默认 0，不等）。实盘实测回调投递在 MainThread 上，而 handler 也在 MainThread —— 等待永远等不到，还白占 adjust 主线程。结果随后落进缓存，下一次调用取到")
     args = parser.parse_args(argv)
 
     from bigqmt_signal_trader.xtquant_compat import XtQuantTrader

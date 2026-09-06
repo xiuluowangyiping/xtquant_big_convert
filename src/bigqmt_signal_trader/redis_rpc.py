@@ -936,6 +936,21 @@ class BigQmtRpcHandlers:
                                     float(wait_seconds)))
         with self._credit_account_lock:
             stamp_before = self._credit_account_stamp
+            known_callback_thread = self._credit_account_callback_thread
+        # 回调如果投递在**本线程**上，等待就永远等不到 —— 我们正占着它。实盘
+        # 实测（真两融账户）：callback_thread="MainThread"，而 handler 也在
+        # MainThread，等满 8 秒 callbacks_seen 不动，那几次回调全是在两次调用
+        # 之间、handler 没占着线程的时候落下的。所以一旦观测到这种情况就不再
+        # 等，直接返回缓存 —— 白等只是把 adjust 主线程按住几秒（#202）。
+        wait_pointless = False
+        if wait_seconds > 0 and known_callback_thread:
+            try:
+                wait_pointless = (known_callback_thread
+                                  == threading.current_thread().name)
+            except Exception:
+                wait_pointless = False
+            if wait_pointless:
+                wait_seconds = 0.0
         issued, reason = self._issue_credit_account_query(account_id)
         deadline = time.time() + wait_seconds
         while issued and time.time() < deadline:
@@ -982,7 +997,12 @@ class BigQmtRpcHandlers:
             "callback_thread": self._credit_account_callback_thread,
             # 这次是不是等超时并把 inflight 放掉了
             "inflight_released": bool(timed_out),
-            "note": ("默认不等回调：查询已发出，结果随后落进缓存，下一次调用即可"
+            # 请求要等、但我们已经知道等不到，得说出来，别让人以为等过了
+            "wait_skipped_same_thread": bool(wait_pointless),
+            "note": ("回调投递在本线程（%s）上，等待永远等不到 —— 已跳过等待。"
+                     "查询已发出，结果随后落进缓存，下一次调用即可取到"
+                     % known_callback_thread) if wait_pointless else
+                    ("默认不等回调：查询已发出，结果随后落进缓存，下一次调用即可"
                      "取到（handler 跑在 adjust 主线程上，等待可能把回调堵在门外）"
                      if wait_seconds == 0 else ""),
         }

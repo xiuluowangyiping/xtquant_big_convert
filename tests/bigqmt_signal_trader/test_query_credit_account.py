@@ -312,6 +312,45 @@ class QueryCreditAccountTest(unittest.TestCase):
         out = handlers.handle("query_credit_account", {})
         self.assertTrue(out["callback_thread"])
 
+    def test_wait_is_skipped_when_the_callback_lands_on_this_very_thread(self):
+        """回调投递在本线程上时，等待永远等不到 —— 别白占 adjust 主线程。
+
+        实盘实测（真两融账户）：callback_thread="MainThread"，handler 也在
+        MainThread，等满 8 秒 callbacks_seen 纹丝不动；那几次回调全是在两次
+        调用之间、handler 没占着线程的时候落下的。
+        """
+        handlers = _handlers(lambda *a: None)
+        handlers.credit_account_min_interval_seconds = 0.0
+        # 先记一次回调，让桥知道回调落在哪条线程上（就是本线程）
+        handlers.note_credit_account(1, _CreditResult())
+
+        started = time.time()
+        out = handlers.handle("query_credit_account", {"wait_seconds": 5})
+
+        self.assertLess(time.time() - started, 1.0, "明知等不到还等了")
+        self.assertTrue(out["wait_skipped_same_thread"])
+        self.assertEqual(out["waited_seconds"], 0.0)
+        self.assertIn("等待永远等不到", out["note"])
+        # 缓存照给
+        self.assertEqual(out["count"], 1)
+
+    def test_wait_is_honoured_when_the_callback_lands_elsewhere(self):
+        """回调走别的线程时，等待是有意义的，不能一刀切砍掉。"""
+        handlers = _handlers(lambda *a: None)
+        handlers.credit_account_min_interval_seconds = 0.0
+        handlers._credit_account_callback_thread = "SomeQmtCallbackThread"
+
+        out = handlers.handle("query_credit_account", {"wait_seconds": 0.2})
+        self.assertFalse(out["wait_skipped_same_thread"])
+        self.assertGreaterEqual(out["waited_seconds"], 0.1)
+
+    def test_nothing_observed_yet_still_honours_an_explicit_wait(self):
+        """还没见过回调时不做假设 —— 照常等。"""
+        handlers = _handlers(lambda *a: None)
+        out = handlers.handle("query_credit_account", {"wait_seconds": 0.2})
+        self.assertFalse(out["wait_skipped_same_thread"])
+        self.assertGreaterEqual(out["waited_seconds"], 0.1)
+
     def test_method_is_whitelisted_and_deferred_to_the_main_thread(self):
         from bigqmt_signal_trader.redis_rpc import (
             LISTENER_DEFERRED_METHODS, READ_METHODS,
