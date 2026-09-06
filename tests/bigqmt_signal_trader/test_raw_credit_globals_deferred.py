@@ -147,6 +147,96 @@ class HktExchangeRateArityTest(unittest.TestCase):
         self.assertTrue(result)
 
 
+class HollowRowProbeTest(unittest.TestCase):
+    """行数不等于有数据 —— probe 自己踩过这个坑，这组用例把它钉死。
+
+    QMT 交易类查询跑在主策略线程之外时，返回的不是空列表，而是**行数对、
+    字段全空**的对象（本机实测：get_asset 移出 defer 名单后照样回 5 个键，
+    cash / total_asset / frozen_cash / market_value 全是 None）。原来 probe
+    只报 len(rows)，于是在一份真两融账户的报告里给出 ok:true rows:71002，
+    而同一次运行走 handler 的同一个函数是 0 行 —— 探测把人带偏了。
+    """
+
+    def test_hollow_rows_are_flagged_not_reported_as_success(self):
+        def get_assure_contract(account_id):
+            # 71002 行，每行字段名齐全、值全是 None —— 跑错线程的签名
+            return [{"m_strInstrumentID": None, "m_dAssureRatio": None}] * 3
+
+        info = _handlers({"get_assure_contract": get_assure_contract}).handle(
+            "probe_capabilities", {})
+        probe = info["credit_probe"]["get_assure_contract"]
+
+        self.assertEqual(probe["rows"], 3)
+        self.assertTrue(probe["hollow"])
+        self.assertEqual(probe["populated_fields"], 0)
+        self.assertIn("字段全空", probe["note"])
+
+    def test_real_rows_are_not_flagged_hollow(self):
+        def get_assure_contract(account_id):
+            return [{"m_strInstrumentID": "600000", "m_dAssureRatio": 0.7}]
+
+        probe = _handlers({"get_assure_contract": get_assure_contract}).handle(
+            "probe_capabilities", {})["credit_probe"]["get_assure_contract"]
+
+        self.assertEqual(probe["rows"], 1)
+        self.assertNotIn("hollow", probe)
+        self.assertEqual(probe["populated_fields"], 2)
+
+    def test_zero_is_a_real_value_not_an_empty_one(self):
+        """没有负债就是 0 —— 不能把 0 当成「没拿到」。"""
+        def get_unclosed_compacts(account_id, account_type):
+            return [{"m_dRealCompactBalance": 0.0, "m_nRealCompactVol": 0}]
+
+        probe = _handlers({"get_unclosed_compacts": get_unclosed_compacts}).handle(
+            "probe_capabilities", {})["credit_probe"]["get_unclosed_compacts"]
+
+        self.assertNotIn("hollow", probe)
+        self.assertEqual(probe["populated_fields"], 2)
+
+    def test_empty_result_is_not_hollow(self):
+        """真的没数据和拿到一堆空行是两回事。"""
+        probe = _handlers({"get_debt_contract": lambda a: []}).handle(
+            "probe_capabilities", {})["credit_probe"]["get_debt_contract"]
+
+        self.assertEqual(probe["rows"], 0)
+        self.assertNotIn("hollow", probe)
+
+    def test_credit_account_object_checks_values_not_key_presence(self):
+        """键在不等于值在 —— has_credit_fields 原来只看键名。"""
+        class _Gw(DryRunOrderGateway):
+            def __init__(self, value):
+                super(_Gw, self).__init__()
+                self.get_trade_detail_data = lambda a, t, d, s="": [{
+                    "m_nBrokerType": 3,
+                    "m_dPerAssurescaleValue": value,
+                    "m_dFinMaxQuota": value,
+                    "m_dSloMaxQuota": value,
+                }]
+
+        def _probe(gateway):
+            return BigQmtRpcHandlers(
+                account_id="acct",
+                market_data=BigQmtMarketDataProvider(_Ctx()),
+                position_provider=None,
+                order_gateway=gateway,
+                qmt_api={},
+            ).handle("probe_capabilities", {})[
+                "credit_probe"]["get_trade_detail_data(CREDIT,ACCOUNT)"]
+
+        # 信用字段全 None、但 m_nBrokerType 有值：整行不算全空（所以不标
+        # hollow，那是对的），可是 has_credit_fields 必须是 False —— 调用方
+        # 要的那几个字段一个都没拿到。
+        partial = _probe(_Gw(None))
+        self.assertFalse(partial["has_credit_fields"])
+        self.assertEqual(partial["populated_fields"], 1)
+        self.assertNotIn("hollow", partial)
+
+        real = _probe(_Gw(2.87))
+        self.assertTrue(real["has_credit_fields"])
+        self.assertEqual(real["populated_fields"], 4)
+        self.assertNotIn("hollow", real)
+
+
 class ThreadRoutingProbeTest(unittest.TestCase):
     """probe_capabilities 要报出线程路由 —— #204 就是被这个盲区拖住的。"""
 

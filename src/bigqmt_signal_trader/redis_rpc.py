@@ -796,9 +796,9 @@ class BigQmtRpcHandlers:
                                 self._configured_account_type(self.account_id)) or []
                 else:
                     rows = func(self.account_id) or []
-                info["credit_probe"][name] = {
-                    "available": True, "ok": True, "rows": len(rows),
-                }
+                report = {"available": True, "ok": True}
+                report.update(self._describe_probe_rows(rows))
+                info["credit_probe"][name] = report
             except Exception as exc:
                 info["credit_probe"][name] = {
                     "available": True, "ok": False,
@@ -921,6 +921,42 @@ class BigQmtRpcHandlers:
             "callback_bound": callable(self.qmt_api.get("query_credit_account")),
         }
 
+    def _describe_probe_rows(self, rows):
+        """行数不等于有数据 —— 这条探测自己踩过这个坑。
+
+        QMT 的交易类查询跑在主策略线程之外时，返回的不是空列表，而是**行数
+        对、字段全空**的对象（本机实测：把 get_asset 移出 defer 名单，它照样
+        返回 5 个键，但 cash / total_asset / frozen_cash / market_value 全是
+        None）。原来这里只报 len(rows)，于是在一份真两融账户的报告里给出了
+        `ok: true, rows: 71002`，而同一次运行里走 handler 的同一个函数是 0 行
+        —— 探测反过来把人带偏了（#204）。
+
+        所以这里过一遍 handler 用的同一个归一化，再看**字段里到底有没有东西**。
+        CLAUDE.md 那句「Verify the meaning, not the shape」，说的就是这个。
+        """
+        report = {"rows": len(rows)}
+        try:
+            normalized = _normalize_detail_rows(rows)
+        except Exception as exc:
+            report["normalize_error"] = "%s: %s" % (exc.__class__.__name__, exc)
+            return report
+        report["normalized_rows"] = len(normalized)
+        first = normalized[0] if normalized else None
+        if not isinstance(first, dict):
+            return report
+        report["fields"] = len(first)
+        # None / "" 才算「没拿到」。0 是合法值（没有负债就是 0），不能当空看。
+        present = [key for key, value in first.items()
+                   if value is not None and value != ""]
+        report["populated_fields"] = len(present)
+        if normalized and not present:
+            # 行在、字段全空 —— 这就是跑错线程的签名，必须说出来，不能让
+            # 一个 rows=71002 看着像成功。
+            report["hollow"] = True
+            report["note"] = ("行数对但字段全空 —— QMT 交易类查询在主策略线程"
+                              "之外就是这个样子，查 thread_routing")
+        return report
+
     def _probe_thread_routing(self):
         """哪些方法跑在后台 listener 线程上，哪些被推回 adjust 主线程。
 
@@ -977,16 +1013,20 @@ class BigQmtRpcHandlers:
         if gateway is None or not callable(get_detail):
             return {"available": False}
         try:
-            rows = _normalize_detail_rows(
-                get_detail(self.account_id, "CREDIT", "ACCOUNT", "")) or []
+            raw = get_detail(self.account_id, "CREDIT", "ACCOUNT", "") or []
         except Exception as exc:
             return {"available": True, "ok": False,
                     "error": "%s: %s" % (exc.__class__.__name__, exc)}
-        report = {"available": True, "ok": True, "rows": len(rows)}
+        report = {"available": True, "ok": True}
+        report.update(self._describe_probe_rows(raw))
+        rows = _normalize_detail_rows(raw) or []
         if rows and isinstance(rows[0], dict):
             report["broker_type"] = rows[0].get("m_nBrokerType")
+            # 键在不等于值在。跑错线程时字段名一个不少、值全是 None，用
+            # `key in row` 判断会报 has_credit_fields=True，而调用方拿到的
+            # 是一行 null —— 和 rows=71002 那个误导是同一个错误（#204）。
             report["has_credit_fields"] = any(
-                key in rows[0] for key in
+                rows[0].get(key) is not None for key in
                 ("m_dPerAssurescaleValue", "m_dFinMaxQuota", "m_dSloMaxQuota"))
         return report
 

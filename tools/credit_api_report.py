@@ -202,6 +202,14 @@ def summarize_rows(rows, full, keys_are_data=False):
                  and not isinstance(first.get(k), bool)
                  and first.get(k) != 0]
     out["non_zero_numeric_fields"] = populated
+    # 行数不等于有数据。QMT 交易类查询跑在主策略线程之外时，返回的是**行数对、
+    # 字段全空**的对象（实测：get_asset 移出 defer 名单后照样回 5 个键，值全是
+    # None）。只看行数会把这种情况判成「有数据」—— 那正是这份报告最该拦住的
+    # 误导（#204）。0 是合法值（没有负债就是 0），只有 None/"" 才算没拿到。
+    present = [k for k in fields
+               if first.get(k) is not None and first.get(k) != ""]
+    out["populated_fields"] = len(present)
+    out["hollow"] = not present
     out["all_numeric_zero"] = (not populated) and any(
         isinstance(first.get(k), (int, float)) and not isinstance(first.get(k), bool)
         for k in fields)
@@ -264,6 +272,9 @@ def verdict_for(entry):
         return "报错", entry.get("error", "")
     envelope = entry.get("envelope") or {}
     if entry.get("row_count"):
+        if entry.get("hollow"):
+            return "有行但字段全空", ("行数对、字段名齐全、值全是 None —— QMT 交易类"
+                                     "查询跑在主策略线程之外就是这样，看 thread_routing")
         if entry.get("all_numeric_zero"):
             return "有行但数值全为 0", "字段回来了，值都是 0 —— 可能是没数据，也可能是没读到"
         key_nz = entry.get("key_credit_fields_non_zero")
@@ -351,6 +362,17 @@ def render_text(report):
             add("  这台终端没有绑上的全局函数: %s" % ", ".join(missing))
     add("")
 
+    routing = (report.get("probe") or {}).get("thread_routing") or {}
+    if routing.get("available"):
+        add("-" * 72)
+        add("线程路由（QMT 交易类查询在主策略线程之外返回空行/空字段）")
+        add("-" * 72)
+        add("  process_in_listener : %s" % routing.get("process_in_listener"))
+        add("  listener 方法数     : %s" % routing.get("listener_method_count"))
+        for name, where in sorted((routing.get("sample") or {}).items()):
+            add("  %-28s %s" % (name, where))
+        add("")
+
     add("-" * 72)
     add("信用委托类型常量（静态核对，没有下过单）")
     add("-" * 72)
@@ -422,6 +444,12 @@ def build_conclusions(report):
                    "没被填上，query_credit_detail 应该回退到查柜台那条。这正是 #202 要解决的。")
     else:
         out.append("信用账户明细两条路都空。请把 probe_capabilities 那一段一起贴上来。")
+
+    hollow = sorted(m for m, e in by_method.items() if e.get("hollow"))
+    if hollow:
+        out.append("这些接口返回了行、但字段全是 None：%s —— 几乎可以肯定是跑在"
+                   "后台线程上了（QMT 交易类查询要主策略线程），把 thread_routing "
+                   "那一段贴上来。" % ", ".join(hollow))
 
     broken = [m for m, e in by_method.items() if not e.get("ok")]
     if broken:

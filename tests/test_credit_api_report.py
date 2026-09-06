@@ -124,6 +124,41 @@ class SummaryTest(unittest.TestCase):
         state, _detail = rep.verdict_for(dict(out, ok=True, method="x"))
         self.assertEqual(state, "有行但数值全为 0")
 
+    def test_hollow_rows_are_not_reported_as_data(self):
+        """行数对、值全 None —— 报告不能判成「有数据」（#204）。"""
+        out = rep.summarize_rows(
+            [{"m_dPerAssurescaleValue": None, "m_dTotalDebt": None}], full=False)
+
+        self.assertTrue(out["hollow"])
+        self.assertEqual(out["populated_fields"], 0)
+        state, detail = rep.verdict_for(dict(out, ok=True, row_count=1))
+        self.assertEqual(state, "有行但字段全空")
+        self.assertIn("thread_routing", detail)
+
+    def test_zero_is_data_not_hollow(self):
+        """没有负债就是 0，不能当成没拿到。"""
+        out = rep.summarize_rows(
+            [{"m_dTotalDebt": 0.0, "m_dFinDebt": 0}], full=False)
+        self.assertFalse(out["hollow"])
+        self.assertEqual(out["populated_fields"], 2)
+
+    def test_conclusions_name_the_hollow_methods(self):
+        report = {
+            "account_shape": {"broker_type": 3},
+            "checks": {
+                "credit_account": [
+                    {"method": "query_credit_detail", "ok": True,
+                     "row_count": 1, "hollow": True}],
+                "credit_contracts": [],
+                "control": [{"method": "query_account_infos", "ok": True,
+                             "row_count": 1}],
+            },
+        }
+        joined = "\n".join(rep.build_conclusions(report))
+        self.assertIn("字段全是 None", joined)
+        self.assertIn("query_credit_detail", joined)
+        self.assertIn("thread_routing", joined)
+
     def test_envelope_is_preserved_verbatim(self):
         """query_credit_account 的信封就是判断柜台通没通的依据，不能被归纳掉。"""
         rows, extra = rep.normalize_result({

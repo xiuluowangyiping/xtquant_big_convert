@@ -11,7 +11,13 @@
 
   这正是 `get_ipo_data` 早就踩过并修掉的坑，它的注释原文就是「交易类查询, 需主线程上下文（后台线程返回空）」—— 当时只修了它一个，孪生方法漏网。现在把所有要交易上下文的 QMT 全局函数补进 defer 名单：`get_assure_contract` / `get_enable_short_contract` / `get_unclosed_compacts` / `get_closed_compacts` / `get_debt_contract` / `get_option_subject_position` / `get_comb_option` / `get_new_purchase_limit` / `get_hkt_exchange_rate`。行情读（`get_ticks` / `get_market_data*` / `get_option_list` / `get_main_contract` …）保持 inline 不动，defer 会白搭上一个 adjust 间隔的延迟；用例同时钉住这两侧。
 
-  **有一处尚未解释**：`probe_capabilities` 同样不在 defer 名单里（和直连 `get_*` 属同一集合），却在那份报告里拿到了 71002/50/52 行。按线程解释它应该也是空的。修复不依赖这个解释成立 —— 它做的是让孪生方法对齐到那条**已被证明能出数**的路径。
+  **机制已在本机复现**（不再是推断）：把 `get_asset` 临时移出 defer 名单，同一次运行里它跑到 `listener_thread`，返回的 `cash` / `total_asset` / `frozen_cash` / `market_value` **全是 `None`**，而对照的 `get_positions` 仍在 `adjust_thread`、数据完整。恢复后 `get_asset` 立刻回到 `adjust_thread` 并给出真实值。同一账号、同一传输，唯一变量是线程。
+
+  这同时解释了先前那个「解释不了的反例」：`probe_capabilities` 跑在 listener 线程上却报出 `rows: 71002`，是因为**它只数了行数没看内容** —— 那 71002 行的字段值全是空的。探测自己踩了 `CLAUDE.md` 里「Verify the meaning, not the shape」这一条。
+
+  实测延迟：新 defer 的四个方法 2.5–3.0ms，和本来就 defer 的持平；`get_ticks` 3.3ms、`ping` 12.4ms，行情读没有被拖慢。
+
+- **`probe_capabilities` 和体检报告都把「空行」当成了「有数据」**：行数不等于有数据。QMT 交易类查询跑错线程时返回的是**行数对、字段全空**的对象，而两边都只看行数 —— 于是一份真两融账户的报告里出现了 `get_assure_contract: ok true, rows 71002`，同一次运行走 handler 的同一个函数却是 0 行，探测反过来在误导排查。现在两边都过一遍 handler 用的同一个归一化，再看字段里到底有没有东西：探测报 `populated_fields` / `hollow`，报告把这种情况判成「有行但字段全空」并在结论里点名。`0` 仍算真值（没有负债就是 0），只有 `None` / `""` 才算没拿到。`has_credit_fields` 原来用 `key in row` 判断，跑错线程时字段名一个不少，照样报 `True` —— 改成看值。
 
 - **`get_hkt_exchange_rate` 一个参数都没传**：官方签名是 `get_hkt_exchange_rate(accountID, accountType)`（6.18，`accountType` 须为 `HUGANGTONG` / `SHENGANGTONG`），handler 调的是零参数版本。`_call_qmt_global` 会把 `TypeError` 吞掉返回 `{}`，从客户端看和「这台终端没有港股通」一模一样。现在按签名传参，`account_type` 可用参数覆盖（默认 `HUGANGTONG`），并改走 `_call_qmt_mapping` —— 它返回的是 dict（买卖参考汇率），过 `_normalize_detail_rows` 会把值全丢掉，和 #96 的 `get_ipo_data` 同一个形状。
 
