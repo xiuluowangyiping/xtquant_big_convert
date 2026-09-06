@@ -1,0 +1,240 @@
+# coding: utf-8
+"""#202: 信用账户「查柜台」通道 query_credit_account + credit_account_callback。
+
+大 QMT 里信用账户的账户明细有两条路：
+
+  同步 get_trade_detail_data(accId, 'CREDIT', 'ACCOUNT')  -> 终端缓存那份
+  异步 query_credit_account(accId, seq, ContextInfo)      -> 柜台那份
+
+第二条只从 credit_account_callback 出来，原来完全没接。这组用例钉住接进来之后
+的三件事：真发得出去、回调落得下来、以及官方 6.13 的限流（「只能有一个查询」
+「建议 30s 一次」）确实挡得住。
+"""
+import os
+import sys
+import threading
+import time
+import unittest
+
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+
+from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
+from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
+from bigqmt_signal_trader.redis_rpc import BigQmtRpcHandlers
+
+
+class _CreditResult(object):
+    """回调交回来的对象是属性袋，不是 dict —— 和 QMT 一样。"""
+
+    def __init__(self):
+        self.m_strAccountID = "acct"
+        self.m_nBrokerType = 3
+        self.m_dPerAssurescaleValue = 2.87
+        self.m_dTotalDebt = 12345.67       # 注意：回调这份是 Debt，不是 Debit
+        self.m_dFinEnableQuota = 500000.0
+
+
+class _Ctx(object):
+    accid = "acct"
+
+    def get_full_tick(self, codes):
+        return {}
+
+
+def _handlers(query_func=None, **kw):
+    qmt_api = {}
+    if query_func is not None:
+        qmt_api["query_credit_account"] = query_func
+    return BigQmtRpcHandlers(
+        account_id="acct",
+        market_data=BigQmtMarketDataProvider(_Ctx()),
+        position_provider=None,
+        order_gateway=DryRunOrderGateway(),
+        qmt_api=qmt_api,
+        **kw
+    )
+
+
+class QueryCreditAccountTest(unittest.TestCase):
+
+    def test_issues_the_query_and_returns_the_callback_result(self):
+        """回调在另一个线程落地，handler 的有界等待要等得到。"""
+        seen = []
+        handlers_box = {}
+
+        def query_credit_account(account_id, seq, context_info):
+            seen.append((account_id, seq, context_info))
+            # QMT 从 C++ 回调线程调进来，这里用一个真线程模拟
+            def fire():
+                time.sleep(0.05)
+                handlers_box["h"].note_credit_account(seq, _CreditResult())
+            threading.Thread(target=fire).start()
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+        out = handlers.handle("query_credit_account", {})
+
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][0], "acct")
+        self.assertIsInstance(seen[0][1], int)
+        self.assertIsNotNone(seen[0][2])            # ContextInfo 必须传下去
+
+        self.assertTrue(out["query_issued"])
+        self.assertTrue(out["fresh"])
+        self.assertFalse(out["stale"])
+        self.assertEqual(out["count"], 1)
+        row = out["rows"][0]
+        self.assertEqual(row["m_dPerAssurescaleValue"], 2.87)
+        self.assertEqual(row["m_dTotalDebt"], 12345.67)
+        self.assertEqual(row["m_nBrokerType"], 3)
+
+    def test_rate_limited_second_call_serves_the_cache_and_says_so(self):
+        """官方建议 30s 一次。第二次不该再打柜台，但也不该假装没数据。"""
+        calls = []
+        handlers_box = {}
+
+        def query_credit_account(account_id, seq, context_info):
+            calls.append(seq)
+            handlers_box["h"].note_credit_account(seq, _CreditResult())
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+
+        first = handlers.handle("query_credit_account", {})
+        second = handlers.handle("query_credit_account", {})
+
+        self.assertEqual(len(calls), 1)             # 只发了一次
+        self.assertTrue(first["fresh"])
+        self.assertFalse(second["query_issued"])
+        self.assertIn("rate limited", second["not_issued_reason"])
+        # 缓存照给，但明说是陈的
+        self.assertEqual(second["count"], 1)
+        self.assertTrue(second["stale"])
+        self.assertFalse(second["fresh"])
+        self.assertIsNotNone(second["age_seconds"])
+
+    def test_min_interval_is_configurable_for_a_deliberate_refresh(self):
+        calls = []
+        handlers_box = {}
+
+        def query_credit_account(account_id, seq, context_info):
+            calls.append(seq)
+            handlers_box["h"].note_credit_account(seq, _CreditResult())
+
+        handlers = _handlers(query_credit_account)
+        handlers_box["h"] = handlers
+        handlers.credit_account_min_interval_seconds = 0.0
+
+        handlers.handle("query_credit_account", {})
+        handlers.handle("query_credit_account", {})
+        self.assertEqual(len(calls), 2)
+
+    def test_unbound_global_is_reported_not_silently_empty(self):
+        """这台部署没注入 query_credit_account —— 要说出来，不能只回空。"""
+        out = _handlers(None).handle("query_credit_account", {})
+
+        self.assertFalse(out["query_issued"])
+        self.assertFalse(out["callback_bound"])
+        self.assertIn("not bound", out["not_issued_reason"])
+        self.assertEqual(out["count"], 0)
+
+    def test_a_throwing_global_is_reported_not_swallowed(self):
+        def query_credit_account(account_id, seq, context_info):
+            raise RuntimeError("counter refused")
+
+        out = _handlers(query_credit_account).handle("query_credit_account", {})
+
+        self.assertFalse(out["query_issued"])
+        self.assertIn("counter refused", out["not_issued_reason"])
+
+    def test_no_callback_within_the_wait_is_not_reported_as_fresh(self):
+        """回调没来就是没来，不能把空/陈的当新数据报上去。"""
+        def query_credit_account(account_id, seq, context_info):
+            pass                                    # 永不回调
+
+        out = _handlers(query_credit_account).handle(
+            "query_credit_account", {"wait_seconds": 0.1})
+
+        self.assertTrue(out["query_issued"])
+        self.assertFalse(out["fresh"])
+        self.assertEqual(out["count"], 0)
+
+    def test_wait_seconds_is_clamped(self):
+        """客户端不能靠一个大 wait_seconds 把 adjust 主线程按住。"""
+        def query_credit_account(account_id, seq, context_info):
+            pass                                    # 永不回调，只能靠上限收场
+
+        handlers = _handlers(query_credit_account)
+        handlers.credit_account_max_wait_seconds = 0.2
+
+        t0 = time.time()
+        handlers.handle("query_credit_account", {"wait_seconds": 3600})
+        self.assertLess(time.time() - t0, 2.0)
+
+    def test_default_ceiling_bounds_the_main_thread_hold(self):
+        from bigqmt_signal_trader.redis_rpc import (
+            CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS, CREDIT_ACCOUNT_MAX_WAIT_SECONDS,
+        )
+        self.assertLessEqual(CREDIT_ACCOUNT_DEFAULT_WAIT_SECONDS, 2.0)
+        self.assertLessEqual(CREDIT_ACCOUNT_MAX_WAIT_SECONDS, 10.0)
+        self.assertEqual(_handlers(None).credit_account_max_wait_seconds,
+                         CREDIT_ACCOUNT_MAX_WAIT_SECONDS)
+
+    def test_callback_never_raises_out_of_the_c_thread(self):
+        """回调里抛异常在 QMT 那边是无堆栈的 SystemError，绝不能漏出去。"""
+        class _Exploding(object):
+            @property
+            def m_dTotalDebt(self):
+                raise RuntimeError("boom")
+
+        handlers = _handlers(lambda *a: None)
+        # 不抛，返回真假即可
+        result = handlers.note_credit_account(1, _Exploding())
+        self.assertIn(result, (True, False))
+
+    def test_method_is_whitelisted_and_deferred_to_the_main_thread(self):
+        from bigqmt_signal_trader.redis_rpc import (
+            LISTENER_DEFERRED_METHODS, READ_METHODS,
+        )
+        # query_credit_account 需要 ContextInfo 和主线程上下文，必须走 drain
+        self.assertIn("query_credit_account", READ_METHODS)
+        self.assertIn("query_credit_account", LISTENER_DEFERRED_METHODS)
+        self.assertIn("query_credit_account", _handlers(None).allowed_methods)
+
+
+class CreditCallbackWiringTest(unittest.TestCase):
+    """QMT 只往被挂载的那个文件回调，所以每个入口文件都要再导出一次。"""
+
+    ENTRY_FILES = (
+        "src/BIGQMT_REDIS_DRYRUN.py",
+        "src/BIGQMT_ZMQ_BACKTEST.py",
+        "src/BIGQMT_REDIS_DRYRUN_ALL_IN_ONE.py",
+        "src/bigqmt_signal_trader_redis_rpc_runtime.py",
+        "src/bigqmt_signal_trader_redis_dryrun.py",
+        "src/bigqmt_signal_trader_dryrun.py",
+        "bigqmt_no_redis/DRYRUN_no_redis.py",
+    )
+
+    def test_every_entry_that_exports_deal_callback_exports_the_credit_one(self):
+        import io
+        missing = []
+        for rel in self.ENTRY_FILES:
+            path = os.path.join(ROOT, rel.replace("/", os.sep))
+            text = io.open(path, encoding="utf-8", errors="replace").read()
+            if "deal_callback" in text and "credit_account_callback" not in text:
+                missing.append(rel)
+        self.assertEqual(missing, [])
+
+    def test_strategy_defines_the_callback_and_binds_the_global(self):
+        import io
+        path = os.path.join(ROOT, "src", "bigqmt_signal_trader_strategy.py")
+        text = io.open(path, encoding="utf-8", errors="replace").read()
+        self.assertIn("def credit_account_callback(ContextInfo, seq, result):", text)
+        # 全局函数要在捕获名单里，否则 handler 永远拿不到它
+        self.assertIn('"query_credit_account",', text)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -244,6 +244,7 @@ try:
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",
         "get_hkt_exchange_rate", "down_history_data",
+        "query_credit_account",   # credit account, counter query, async (#202)
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]
@@ -263,3 +264,7 @@ handlebar = _runtime.handlebar
 adjust = _runtime.adjust
 order_callback = _runtime.order_callback
 deal_callback = _runtime.deal_callback
+# Credit-account counter query callback. QMT only calls back into the
+# namespace of the file it mounted, so this has to be re-exported here
+# the same way order_callback / deal_callback are (#202).
+credit_account_callback = _runtime.credit_account_callback

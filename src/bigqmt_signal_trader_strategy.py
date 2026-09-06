@@ -486,6 +486,9 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     "get_unclosed_compacts",          # 未平仓合约（负债）
     "get_closed_compacts",            # 已平仓合约
     "get_debt_contract",              # 负债合约
+    # 信用账户明细，查柜台的那条路。异步：结果只从 credit_account_callback
+    # 出来，见下面的 credit_account_callback 和 #202。
+    "query_credit_account",
     "get_option_subject_position",    # 期权标的持仓
     "get_comb_option",                # 组合期权
     "get_hkt_exchange_rate",          # 港股通汇率
@@ -1855,6 +1858,29 @@ def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
     _publish_exec_event("trade", dealInfo, ContextInfo)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
+
+
+def credit_account_callback(ContextInfo, seq, result):
+    """Standard Big QMT credit-account callback (官方参考 6.13).
+
+    信用账户明细只有这一条查柜台的路：query_credit_account 立刻返回，结果从这里
+    出来。QMT 只往被挂载的那个文件的命名空间里回调，所以每个入口文件都要像
+    order_callback / deal_callback 那样再导出一次这个名字（#202）。
+
+    回调跑在 QMT 的 C++ 线程上，所以这里只把结果交给 handlers 存着，绝不做需要
+    主线程上下文的事，也绝不让异常逃出去 —— 回调里抛异常在 QMT 那边表现为没有
+    堆栈的 SystemError（issue #76）。
+    """
+    try:
+        handlers = getattr(_rpc_service, "handlers", None) if _rpc_service else None
+        if handlers is None or not hasattr(handlers, "note_credit_account"):
+            return False
+        return handlers.note_credit_account(seq, result)
+    except Exception as exc:
+        _log_err("credit_account_callback",
+                 "recording the credit account detail failed: %s (%s)"
+                 % (exc, exc.__class__.__name__))
+        return False
 
 
 def sync_positions(ContextInfo):
