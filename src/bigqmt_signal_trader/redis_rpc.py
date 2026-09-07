@@ -115,6 +115,7 @@ ORDER_METHODS = {
     "submit_order",
     "submit_orders_batch",
     "cancel_order",
+    "cancel_orders_batch",
     # Raw native-passorder passthrough (route 2). Gated behind
     # allow_order_methods like every other write, and deferred to the adjust
     # thread by virtue of not being in READ_METHODS.
@@ -208,6 +209,7 @@ METHOD_ALIASES = {
     "order_stock_batch": "submit_orders_batch",
     "cancel_order_stock": "cancel_order",
     "cancel_order_stock_sysid": "cancel_order",
+    "cancel_order_stock_batch": "cancel_orders_batch",
 }
 
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
@@ -1493,22 +1495,26 @@ class BigQmtRpcHandlers:
         )
 
     def _attribute_to_strategies(self, account_id, snapshots):
-        """Put the strategy name back on rows QMT could not name (issue #133).
+        """Put the caller's strategy name on rows this bridge submitted.
 
         Neither the ORDER nor the DEAL rows get_trade_detail_data returns carry
         m_strStrategyName -- checked by listing every attribute on a live
-        terminal. QMT filters by strategy but does not report it, which is why
-        this field read as "" for everything.
+        terminal. What the row DOES carry (m_strSource) is the QMT-side
+        strategy's registered name -- this bridge process's name, e.g.
+        BIGQMT_REDIS_DRYRUN -- not the strategy_name the caller passed at order
+        time (#216: placed as 'DaBanStrategy', reported as '大QMT桥接器').
+        #174 misread that field as "passorder's strategyName coming back".
 
         Orders this bridge submitted are remembered at submit time, keyed by
-        the user_order_id that rides out as the order remark, so those can be
-        named. Orders placed by hand in the terminal have no remark and stay
-        unnamed; there is nothing to recover for them.
+        the user_order_id that rides out as the order remark, and that record
+        is authoritative -- it WINS over the row's field whenever it has a
+        name. Rows without a remark (hand-placed orders) or without an
+        identity record (another process's orders) keep the row's value.
         """
         rows = list(snapshots or [])
-        unnamed = [row for row in rows
-                   if not str(getattr(row, "strategy_name", "") or "").strip()]
-        if not unnamed:
+        candidates = [row for row in rows
+                      if str(getattr(row, "user_order_id", "") or "").strip()]
+        if not candidates:
             return rows
         redis_client = self._identity_redis()
         if redis_client is not None:
@@ -1517,8 +1523,8 @@ class BigQmtRpcHandlers:
 
                 identities = order_identity_map(
                     redis_client, account_id,
-                    [getattr(row, "user_order_id", "") for row in unnamed])
-                for row in unnamed:
+                    [getattr(row, "user_order_id", "") for row in candidates])
+                for row in candidates:
                     identity = identities.get(
                         str(getattr(row, "user_order_id", "") or "").strip())
                     if identity and identity.get("strategy_name"):
@@ -1526,13 +1532,12 @@ class BigQmtRpcHandlers:
             except Exception:
                 pass
         # No-Redis deployments still name what THIS process submitted: the
-        # in-process journal written at submit time (issue #156).
+        # in-process journal written at submit time (issue #156). It runs
+        # after the redis store so this process's own record wins a collision.
         journal = getattr(self, "_order_identity_local", None)
         if journal:
             now = time.time()
-            for row in unnamed:
-                if str(getattr(row, "strategy_name", "") or "").strip():
-                    continue
+            for row in candidates:
                 key = (str(account_id or ""),
                        str(getattr(row, "user_order_id", "") or "").strip())
                 entry = journal.get(key)
@@ -2672,6 +2677,60 @@ class BigQmtRpcHandlers:
         else:
             self._pending_settlement = settlement
         return result
+
+    def _handle_cancel_orders_batch(self, params):
+        """Cancel N orders in one RPC.
+
+        Settlement lookups are skipped (same reason as submit_orders_batch:
+        get_trade_detail_data is empty off the adjust thread). The cancel
+        callback on the client confirms the outcome asynchronously.
+        """
+        if self.order_gateway is None:
+            raise RuntimeError("order_gateway is not configured")
+        items = params.get("items") or []
+        if not isinstance(items, list) or not items:
+            raise ValueError("items must be a non-empty list")
+        if len(items) > 500:
+            raise ValueError("items exceeds batch limit 500")
+        results = []
+        for index, item in enumerate(items):
+            item = dict(item or {})
+            account_id = item.get("account_id") or self._request_account_id(params)
+            order_sys_id = str(
+                item.get("order_sysid")
+                or item.get("order_sys_id")
+                or item.get("order_id")
+                or ""
+            )
+            market = str(item.get("market") or "")
+            # accepted/confirmed mirror the submit batch's vocabulary: the
+            # native cancel return answers "the request went out", not "the
+            # order is cancelled" -- and it lies in BOTH directions live
+            # (#148: false while the order was cancelled 67ms later; #151:
+            # true for an order that did not exist). The single-cancel path
+            # settles against the order snapshot; this batch path skips that
+            # (it is the latency the batch exists to avoid), so nothing here
+            # may claim "cancelled". The confirmation is the order-status push
+            # (54) or a query read-back.
+            entry = {"index": index, "success": False,
+                     "accepted": False, "confirmed": False}
+            if not order_sys_id:
+                entry["error"] = "order_sysid is required"
+                results.append(entry)
+                continue
+            order_ref = OrderRef(
+                order_sys_id=order_sys_id,
+                user_order_id=str(item.get("user_order_id") or ""),
+            )
+            try:
+                result = self.order_gateway.cancel(order_ref, account_id=account_id)
+                entry["success"] = bool(getattr(result, "success", result))
+                entry["accepted"] = True
+                entry["message"] = str(getattr(result, "message", "") or "")
+            except Exception as exc:
+                entry["error"] = "%s: %s" % (type(exc).__name__, exc)
+            results.append(entry)
+        return results
 
     def _settle_cancel_from_status(self, settlement, status, order_sys_id, final):
         """One status answer, from the watch table or the snapshot row."""

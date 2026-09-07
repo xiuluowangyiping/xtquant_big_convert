@@ -166,6 +166,31 @@ def _raw_frame_columns(field_list):
     return columns
 
 
+def _market_data_answer_empty(answer):
+    """True when no code in the answer carries a single row.
+
+    Covers both shapes get_market_data_ex can return: the raw path's
+    serialisable marker dict (records list) and the plain path's pandas
+    frames (index length). Anything unrecognised counts as an answer rather
+    than as empty -- a retry must never replace data with nothing.
+    """
+    if not isinstance(answer, dict) or not answer:
+        return True
+    for value in answer.values():
+        if isinstance(value, dict) and value.get("__bigqmt_type__") == "DataFrame":
+            if value.get("records"):
+                return False
+        elif hasattr(value, "index"):
+            try:
+                if len(value.index) > 0:
+                    return False
+            except Exception:
+                return False
+        elif value:
+            return False
+    return True
+
+
 def _raw_market_data_payload(payload, field_list, stock_list):
     if not isinstance(payload, dict):
         return payload
@@ -786,7 +811,35 @@ class BigQmtMarketDataProvider:
             )
         )
 
+    # Synthesis periods (weekly and up) where an all-fields (field_list=[])
+    # answer of zero rows is not necessarily truthful: a live terminal
+    # reported 0 rows for 1mon/1q/1hy/1y with fields=[] while the same bars
+    # read fine with an explicit OHLCV list (issue #219). [] means "all
+    # columns" to QMT, and how a build expands that for synthesized periods is
+    # not trustworthy. Retry once with the explicit K-line field list from the
+    # terminal's own reference; an empty retry still means empty.
+    _SYNTH_PERIOD_FIELD_RETRY = ("1w", "1mon", "1q", "1hy", "1y")
+    _KLINE_ALL_FIELDS = (
+        "time", "open", "high", "low", "close", "volume", "amount",
+        "settle", "openInterest", "preClose", "suspendFlag",
+    )
+
     def get_market_data_ex(self, **kwargs):
+        answer = self._get_market_data_ex_once(**kwargs)
+        fields = kwargs.get("field_list") or kwargs.get("fields")
+        period = str(kwargs.get("period") or "")
+        if (fields or period not in self._SYNTH_PERIOD_FIELD_RETRY
+                or not _market_data_answer_empty(answer)):
+            return answer
+        retry = dict(kwargs)
+        retry.pop("fields", None)
+        retry["field_list"] = list(self._KLINE_ALL_FIELDS)
+        retried = self._get_market_data_ex_once(**retry)
+        # The retry is a strict improvement only when it found rows; otherwise
+        # keep the original (empty) answer, so "no data" stays "no data".
+        return retried if not _market_data_answer_empty(retried) else answer
+
+    def _get_market_data_ex_once(self, **kwargs):
         raw_method = getattr(self.context_info, "get_market_data_ex_ori", None)
         if callable(raw_method):
             raw_data = self._call_first_supported(
@@ -866,6 +919,26 @@ class BigQmtMarketDataProvider:
             return None
         return func(stock_code, start_time, end_time)
 
+    def _download_daily_window(self, stock_code, start_time, end_time):
+        """One terminal-side daily-bars download for a window that scanned
+        empty (#222).
+
+        Uses the terminal's own downloader (the injected
+        ``download_history_data`` / ``down_history_data`` global), never the
+        embedded xtdata SDK -- that one has no reachable data service in the
+        full terminal. True when a downloader answered; False when there is no
+        channel or it raised -- the caller keeps the original honest error.
+        """
+        download = (self.qmt_api.get("download_history_data")
+                    or self.qmt_api.get("down_history_data"))
+        if not callable(download):
+            return False
+        try:
+            download(stock_code, "1d", start_time, end_time)
+        except Exception:
+            return False
+        return True
+
     def _divid_candidate_days(self, stock_code, start_time, end_time):
         """Days in the window that look like ex-dividend days.
 
@@ -905,22 +978,46 @@ class BigQmtMarketDataProvider:
         tell, and saying so is the only honest answer.
         """
         self._divid_scan_rows = 0
+        # Set before the scan so the error can say what was tried (#222).
+        self._divid_download_note = (
+            ". Download the daily history first (download_history_data), or "
+            "ask one date at a time")
         try:
             candidates = self._divid_candidate_days(stock_code, start_time, end_time)
         except Exception:
             candidates = []
+        if self._divid_scan_rows < 2 and self._download_daily_window(
+                stock_code, start_time, end_time):
+            # #222: the bridge knows what is missing, so it fetches it rather
+            # than telling the caller to. The downloader may answer before the
+            # bars are actually local, so rescan a few times on a short leash
+            # before concluding anything.
+            self._divid_download_note = (
+                ". The bridge downloaded the daily window itself "
+                "(download_history_data) and the terminal still returned %d "
+                "daily bar(s)" )
+            for _attempt in range(3):
+                try:
+                    candidates = self._divid_candidate_days(
+                        stock_code, start_time, end_time)
+                except Exception:
+                    candidates = []
+                if self._divid_scan_rows >= 2:
+                    break
+                time.sleep(1.0)
+            self._divid_download_note %= self._divid_scan_rows
         if self._divid_scan_rows < 2:
             raise RuntimeError(
                 "get_divid_factors(%r, %s, %s) cannot answer a range here: big "
                 "QMT's ContextInfo takes only (code, single date), so the range "
                 "is expanded by scanning daily bars for ex-dividend days -- and "
                 "this terminal returned %d daily bar(s) for that window, too "
-                "few to compare even one preClose against the previous close. "
-                "Download "
-                "the daily history first (download_history_data), or ask one "
-                "date at a time. Returning {} would have been indistinguishable "
-                "from 'no dividends in this range' (issue #165)."
-                % (stock_code, start_time, end_time, self._divid_scan_rows))
+                "few to compare even one preClose against the previous close"
+                "%s. Returning {} would have been indistinguishable from 'no "
+                "dividends in this range' (issue #165)."
+                % (stock_code, start_time, end_time, self._divid_scan_rows,
+                   self._divid_download_note))
+        merged = {}
         merged = {}
         for day in candidates[:self._DIVID_MAX_PROBES]:
             try:
