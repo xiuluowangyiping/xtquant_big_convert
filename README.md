@@ -62,7 +62,7 @@ python -m bigqmt_signal_trader.init_config
 
 几个不问、直接定死的选项：
 
-- **`rpc_background_threads` 恒为 `False`** —— `get_trade_detail_data` 离开主策略线程返回空，这不是可选项
+- **`rpc_background_threads` 按传输选**（redis `True`、zmq/pipe `False`）—— 选反了差 4~37 倍，向导按你选的传输定，不问
 - **`rpc_allow_order_methods` 默认 `False`** —— 打开前会明确提示：任何能连上这条通道的程序都可以下单
 - 选了**无 redis 单文件**会自动把传输改成 zmq，不会留下一份声称用 redis 的配置
 
@@ -952,8 +952,35 @@ xt_trader.cancel_order_stock(acc, order_id)   # 撤单送回的是原始字符�
 
 | 部分 | 运行位置 | Python | 装什么 |
 |------|---------|--------|--------|
-| **客户端**（外部程序）| 你的开发机 | 3.8+（推荐）| `pip install xtquant-big-convert` |
-| **服务端**（QMT 内）| QMT 的 `bin.x64/python.exe` | 3.6（QMT 自带）| 按传输装 1 个包 |
+| **客户端**（外部程序）| 你的开发机 | **3.8 ~ 3.13** | `pip install xtquant-big-convert` |
+| **服务端**（QMT 内）| QMT 的 `bin.x64/python.exe` | 3.6（QMT 自带，改不了）| 按传输装 1 个包 |
+
+### 版本约束（装之前先看这个）
+
+**客户端 Python 建议不超过 3.13。** 3.8~3.13 是实际跑过的范围。更高的版本没有
+测过 —— 直接依赖（pyzmq / msgpack / pandas / numpy）都已经有 3.14 的轮子，所以
+不是装不上的问题，只是没验证过，遇到怪问题请先退回 3.13 再报。
+
+**`redis` 包不要装 8.x。** 已在 `[redis]` extra 里限制为 `>=5.0.0,<8.0.0`。
+8.x 改了两个默认值，实测：
+
+| redis-py | `protocol` 默认 | 默认重试次数 |
+|---|---|---|
+| 5.2.1 | 2 | 0（不重试）|
+| 6.4.0 | 2 | 3 |
+| 7.4.0 | 2 | 3 |
+| **8.1.0** | **None** | **10** |
+
+重试次数要紧，因为 RPC 请求是用 `RPUSH` 发的，而 **`RPUSH` 不幂等**：redis-py
+的重试包住的是「发送 + 读应答」，服务端已经收下、只是应答丢了的情况下，同一条
+`RPUSH` 会被重发 —— 一次下单可能派发两次（#245）。服务端从 0.3.29 起按
+`request_id` 去重兜住了这条，但没有理由把默认重试次数从 3 抬到 10。
+
+**QMT 端（服务端）的 redis 更要小心:它是 Python 3.6。** redis-py 从 4.4 起要求
+Python 3.7+，所以 QMT 里能装的最高是 **4.3.x**；QMT 自带的是 3.5.3，本项目按版本
+能力透传参数，能直接用。在 QMT 目录里 `pip install -U redis` 是自找麻烦 ——
+issue #71「最新代码 QMT 报错」就是给 3.5.3 传了它不认识的 `protocol` 参数导致的
+`TypeError`。**没有特别理由，不要动 QMT 自带的 redis。**
 
 ### A. 客户端（外部程序，推荐 pip 安装）
 
@@ -1121,16 +1148,20 @@ BIGQMT_REDIS_CONFIG = {
     "rpc_allow_order_methods": False,    # 下单默认关闭
     "rpc_process_in_listener": True,     # 只读请求在收包线程直接处理（低延迟）
     "rpc_listener_methods": ("*",),      # * = 所有只读方法
-    "rpc_background_threads": False,     # redis 用 QMT adjust 线程 drain
+    "rpc_background_threads": True,      # redis 用后台收包线程（最快）
     "schedule_adjust": True,
-    "schedule_adjust_interval": "500nMilliSecond",
+    "schedule_adjust_interval": "100nMilliSecond",
 }
 ```
 
-> **`rpc_background_threads` 保持 `False`**，包括 zmq 和 mysql。0.3.21 起这两种传输
-> 也支持 adjust 线程 drain（#183），实测把 zmq 的 ping 从 405ms 降到 95ms、交易查询从
-> 607ms 降到 95ms。0.3.21 之前它们必须设 `True`，现在设 `True` 等于主动放弃这段提速。
-> 不写这个键则沿用历史默认（开后台线程）。
+> **这个开关按传输选，没有一个值对所有传输都最好**（实测见上面的传输对比表）：
+> redis 用 `True`（3.4ms，`brpop` 唤醒是即时的）；zmq / pipe / mysql 用 `False`
+> 走 adjust drain（zmq 15.8ms），因为它们的后台线程每次都要付跨线程 GIL 交接，
+> 约一个 adjust tick。zmq 配 `True` 是 592.9ms，慢 37 倍。不写这个键则沿用历史
+> 默认（开后台线程）—— 对 redis 正好是对的，对 zmq / pipe 不是。
+>
+> 安全性不依赖这个开关：碰交易上下文的方法（`LISTENER_DEFERRED_METHODS`）在展开
+> listener 名单时被无条件剔除，任何配置都无法把它们排到后台线程上（#244）。
 
 ### 第 3 步：在 QMT 里运行策略
 
