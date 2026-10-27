@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 和 [语义化版本](https://semver.org/)。
 
+## [0.3.76] - 2026-10-27
+
+### 修复
+
+- **信用账户 23/24 提交时翻译为担保品 opType 33/34**：MiniQMT 语义里 CREDIT_BUY/SELL
+  就是 23/24（担保品买卖），但 passorder 的 23/24 是普通买卖、33/34 才是担保品。
+  2.0.8 终端对信用账户的 23/24 宽容地按担保品成交；2.1.33 走普通买卖路径，订单
+  静默不进系统——passorder 返回但无委托行，结算终点报 submitted but order not
+  found（2026-10-27 实测：同参数 opType 改 34 即正常落委托列表带合同号）。现在
+  submit() 对 CREDIT 账户的 23/24 送 33/34，普通账户保持 23/24，两融 27-32 与
+  专项 70-75 翻译不变；客户端读回侧本就把 33/34 译回 23/24，往返对称。
+- **单文件外壳改用 capture_qmt_injected_funcs 捕获 QMT 全局函数**：手抄名单自
+  0.2.12 起停在 get_hkt_exchange_rate，download_history_data /
+  download_history_data2 / down_history_data、query_credit_account 与公式族在
+  所有单文件构建里都没绑定——download RPC 报 no download channel，终端已有
+  数据时被读到的行盖住像下载成功。两个构建器（b64 与 flat）同步改为从策略模块
+  的唯一名单捕获，_singlefile 打包副本同步；反手抄测试覆盖单文件模板。
+
 ## [0.3.75] - 2026-10-26
 
 ### 修复
